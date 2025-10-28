@@ -1,4 +1,4 @@
-FROM dsalvat1/cudagl:12.3.1-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 # Declare the HM3D argument
 ARG HM3D
@@ -34,7 +34,6 @@ RUN if [ -z "${HM3D}" ]; then \
     
 WORKDIR /onemap
 
-
 RUN apt update && apt install -y --no-install-recommends \
     build-essential \
     git \
@@ -48,10 +47,34 @@ RUN apt update && apt install -y --no-install-recommends \
     ninja-build \
     python3.10-dev \
     python3-pip \
-    python-is-python3\
-    libjpeg-dev libglm-dev libgl1-mesa-glx libegl1-mesa-dev mesa-utils xorg-dev freeglut3-dev \
-    unzip &&\
-    apt-get clean all &&\
+    python-is-python3 \
+    libjpeg-dev \
+    libglm-dev \
+    libgl1-mesa-glx \
+    libegl1-mesa-dev \
+    mesa-utils \
+    xorg-dev \
+    freeglut3-dev \
+    libegl-dev \
+    libegl-mesa0 \
+    libegl1 \
+    libgl1-mesa-dev \
+    libgl1-mesa-dri \
+    libglapi-mesa \
+    libglu1-mesa \
+    libglu1-mesa-dev \
+    libglvnd-core-dev \
+    libglvnd-dev \
+    libglvnd0 \
+    libglx-dev \
+    libglx-mesa0 \
+    libglx0 \
+    libwayland-egl1 \
+    libxcb-glx0 \
+    mesa-common-dev \
+    mesa-utils-bin \
+    unzip && \
+    apt-get clean all && \
     rm -rf /var/lib/apt/lists/*
 
 # #
@@ -78,6 +101,8 @@ COPY ./spot_utils ./spot_utils
 COPY ./vision_models ./vision_models
 COPY ./eval_habitat.py .
 COPY ./eval_habitat_multi.py .
+COPY ./read_results.py .
+COPY ./read_results_multi.py .
 COPY ./onemap_utils ./onemap_utils
 COPY ./habitat_test.py ./
 RUN python3 -m pip install ./planning_cpp/
@@ -109,8 +134,18 @@ RUN mv multiobject_episodes datasets/ && rm multiobject_episodes.zip
 RUN wget https://dl.fbaipublicfiles.com/habitat/data/datasets/objectnav/hm3d/v1/objectnav_hm3d_v1.zip
 RUN unzip objectnav_hm3d_v1.zip
 RUN mv objectnav_hm3d_v1 datasets/ && rm objectnav_hm3d_v1.zip
+# Need v2 for multi-object lookup.
+RUN wget https://dl.fbaipublicfiles.com/habitat/data/datasets/objectnav/hm3d/v2/objectnav_hm3d_v2.zip
+RUN unzip objectnav_hm3d_v2.zip
+RUN mv objectnav_hm3d_v2 datasets/ && rm objectnav_hm3d_v2.zip
 
 
-ENTRYPOINT ["sh", "-c", "if [ \"$HM3D\" = \"LOCAL\" ]; then ln -s $(ls /onemap/datasets/versioned_data/hm3d-0.2/hm3d | grep -v \"hm3d_basis.scene_dataset_config.json\" | sed \"s#^#/onemap/datasets/versioned_data/hm3d-0.2/hm3d/#\") /onemap/datasets/scene_datasets/hm3d/; fi && exec \"$@\"", "--"]
+ENTRYPOINT ["sh", "-c", "\
+if [ \"$HM3D\" = \"LOCAL\" ]; then \
+  for file in $(ls /onemap/datasets/versioned_data/hm3d-0.2/hm3d | grep -v \"hm3d_basis.scene_dataset_config.json\"); do \
+    ln -sf \"/onemap/datasets/versioned_data/hm3d-0.2/hm3d/$file\" \"/onemap/datasets/scene_datasets/hm3d/$file\"; \
+  done; \
+  ln -sf /onemap/datasets/scene_datasets/hm3d /onemap/datasets/scene_datasets/hm3d_v0.2; \
+fi && exec \"$@\"", "--"]
 
 CMD ["/bin/bash"]

@@ -28,6 +28,13 @@ In summary we open-source:
 - The multi-object navigation dataset and benchmark
 - The multi-object navigation dataset generation code, such that you can generate your own datasets
 
+## Changes
+- [28/10/2025]: Docker build to CUDA 12.8 for RTX 50 series support. Fixed issues with reading the results for multi-object nav.
+
+## Upcoming Changes
+- Change annotation format for multi-object nav to match paper naming, see below.
+- Release full CUDA port of onemap.
+
 ## Abstract
 The capability to efficiently search for objects in complex environments is fundamental for many real-world robot 
 applications. Recent advances in open-vocabulary vision models have resulted in semantically-informed object navigation \
@@ -120,6 +127,68 @@ wget https://github.com/ChaoningZhang/MobileSAM/raw/refs/heads/master/weights/mo
 ```
 ### 4. Download the habitat data
 
+Create the datasets directory:
+```
+mkdir -p datasets
+```
+
+#### Download HM3D Scene Dataset
+You can obtain access to Matterport for free [here](https://matterport.com/partners/meta). Once you have your credentials, download the HM3D scenes:
+
+```
+python3 -m habitat_sim.utils.datasets_download \
+  --username <MATTERPORT_ID> --password <MATTERPORT_SECRET> \
+  --uids hm3d_train_v0.2 \
+  --data-path datasets
+
+python3 -m habitat_sim.utils.datasets_download \
+  --username <MATTERPORT_ID> --password <MATTERPORT_SECRET> \
+  --uids hm3d_val_v0.2 \
+  --data-path datasets
+```
+
+Create the `hm3d_v0.2` symlink if not already there:
+```
+ln -s datasets/scene_datasets/hm3d datasets/scene_datasets/hm3d_v0.2
+```
+
+#### Download Navigation Episode Datasets
+
+Download the multi-object episodes dataset:
+```
+gdown 1lBpYxXRjj8mDSUTI66xv0PfNd-vdSbNj -O multiobject_episodes.zip
+unzip multiobject_episodes.zip
+mv multiobject_episodes datasets/
+rm multiobject_episodes.zip
+```
+
+Download ObjectNav HM3D v1 dataset:
+```
+wget https://dl.fbaipublicfiles.com/habitat/data/datasets/objectnav/hm3d/v1/objectnav_hm3d_v1.zip
+unzip objectnav_hm3d_v1.zip
+mv objectnav_hm3d_v1 datasets/
+rm objectnav_hm3d_v1.zip
+```
+
+Download ObjectNav HM3D v2 dataset (required for multi-object navigation):
+```
+wget https://dl.fbaipublicfiles.com/habitat/data/datasets/objectnav/hm3d/v2/objectnav_hm3d_v2.zip
+unzip objectnav_hm3d_v2.zip
+mv objectnav_hm3d_v2 datasets/
+rm objectnav_hm3d_v2.zip
+```
+
+Your `datasets/` directory should now contain:
+```
+datasets/
+├── scene_datasets/
+│   ├── hm3d/
+│   └── hm3d_v0.2/
+├── versioned_data/hm3d-0.2/hm3d/
+├── multiobject_episodes/
+├── objectnav_hm3d_v1/
+└── objectnav_hm3d_v2/
+```
 
 ## Running the code
 ### 1. Run the example
@@ -161,6 +230,9 @@ This will run the evaluation and save the results in the `results_multi/` direct
 ```
 python3 read_results_multi.py --config config/mon/eval_multi_conf.yaml
 ```
+
+**Note that the resulting table will report multiple metrics which correspond to the following names in the paper (table->paper name): SPL->PPL, Progress->PR, s->SR, s_spl->SPL.**
+
 #### Dataset generation
 While we provide the generated dataset for the evaluation of multi-object navigation, we also release the code to
 generate the datasets with varying parameters. You can generate the dataset with
