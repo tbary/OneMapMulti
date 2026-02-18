@@ -21,6 +21,9 @@ from scipy.spatial.transform import Rotation as R
 
 import rerun as rr
 
+def rotate_frame(points):
+    return [[y, x] for (x, y) in points]
+
 class Actor(ABC):
     @abstractmethod
     def act(self,
@@ -112,7 +115,7 @@ class MONActor(Actor):
                 else:
                     path = Planning.simplify_path(np.array(path))
                     path = np.array(path).astype(np.float32)
-                    rr.log("map/path_simplified",  rr.LineStrips2D(path, colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
+                    rr.log("map/path_simplified",  rr.LineStrips2D(rotate_frame(path), colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
                                                                                 path.shape[0], axis=0)))
                     for i in range(path.shape[0]):
                         path[i, :] = self.mapper.one_map.px_to_metric(path[i, 0], path[i, 1])

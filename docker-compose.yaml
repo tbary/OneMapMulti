@@ -26,3 +26,5 @@ services:
               capabilities: [gpu]
     stdin_open: true
     tty: true
+    volumes:
+      - .:/onemap

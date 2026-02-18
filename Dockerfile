@@ -109,6 +109,7 @@ RUN python3 -m pip install ./planning_cpp/
 RUN mkdir datasets
 
 ENV PYTHONPATH="${PYTHONPATH}:/onemap/"
+ENV ROBOFLOW_API_KEY="FZtqpuOS9ITZiHjmxvWy"
 
 RUN  if [ "$HM3D" = "MINI" ] ; then python3 -m habitat_sim.utils.datasets_download \
   --username $MATTERPORT_ID --password $MATTERPORT_SECRET \

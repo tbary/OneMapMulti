@@ -2,10 +2,15 @@
 *.png
 weights/*
 
+.devcontainer
+.env
 # Pycache
 **__pycache__**
 results*/
 *.pt
+*.gz
+*.zip
+*.zip.1
 yolov7
 weights
 datasets

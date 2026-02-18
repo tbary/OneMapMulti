@@ -35,6 +35,8 @@ import rerun as rr
 # cv2
 import cv2
 
+def rotate_frame(points):
+    return [[y, x] for (x, y) in points]
 
 def closest_point_within_threshold(nav_goals: List[NavGoal], target_point: np.ndarray, threshold: float) -> int:
     """Find the point within the threshold distance that is closest to the target_point.
@@ -363,7 +365,7 @@ class Navigator:
             if self.path:
                 if self.log:
                     rr.log("path_updates", rr.TextLog(f"Computed path of length {len(self.path)}"))
-                    rr.log("map/path", rr.LineStrips2D(self.path, colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
+                    rr.log("map/path", rr.LineStrips2D(rotate_frame(self.path), colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
                                                                                    len(self.path), axis=0)))
         else:
             # We go to an object
@@ -378,7 +380,7 @@ class Navigator:
             self.is_goal_path = True
             if self.path and len(self.path) > 0:
                 if self.log:
-                    rr.log("map/path", rr.LineStrips2D(self.path, colors=np.repeat(np.array([0, 255, 0])[np.newaxis, :],
+                    rr.log("map/path", rr.LineStrips2D(rotate_frame(self.path), colors=np.repeat(np.array([0, 255, 0])[np.newaxis, :],
                                                                                    len(self.path), axis=0)))
                     rr.log("path_updates",
                            rr.TextLog(f"Path to object {self.query_text[0]} of length {len(self.path)} computed."))
@@ -541,7 +543,14 @@ class Navigator:
             self.sam_predictor.set_image(image.transpose(1, 2, 0))
             for area, confidence in zip(detections["boxes"], detections['scores']):
                 if self.log:
-                    rr.log("camera/detection", rr.Boxes2D(array_format=rr.Box2DFormat.XYXY, array=area))
+                    rr.log(
+                        "camera/detection", 
+                        rr.Boxes2D(
+                            array_format=rr.Box2DFormat.XYXY, 
+                            array=area, colors=[[255,0,0] if confidence<0.7 else [0,255,0]],
+                            labels=[f"Conf: {confidence:.2f}"]
+                        ), 
+                    )
                     rr.log("object_detections", rr.TextLog(f"Object {self.query_text[0]} detected"))
 
                 # TODO Find free point in front of object
@@ -628,7 +637,7 @@ class Navigator:
                                 rr.log("path_updates",
                                        rr.TextLog(f"The object {self.query_text[0]} has been detected just now."))
                                 rr.log("map/goal_pos",
-                                       rr.Points2D([self.chosen_detection], colors=[[0, 255, 0]], radii=[1]))
+                                       rr.Points2D(rotate_frame([self.chosen_detection]), colors=[[0, 255, 0]], radii=[3]))
         elif not self.object_detected:
             self.chosen_detection = None
             self.object_detected = False

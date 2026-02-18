@@ -37,6 +37,7 @@ running = True
 
 if __name__ == "__main__":
     config = load_config().Conf
+
     if type(config.controller) == HabitatControllerConf:
         pass
     else:
@@ -116,8 +117,7 @@ if __name__ == "__main__":
     }
 
     # Main simulation loop
-    initial_sequence = ["turn_left"] * 28 * 2  # + ["move_forward"]*10
-    # initial_sequence = ["turn_left"]*5 + ["move_forward"]*5
+    initial_sequence = ["turn_left"] * 56
     qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
     running = True
     autonomous = True
@@ -125,13 +125,11 @@ if __name__ == "__main__":
     while running:
         action = None
         if len(initial_sequence):
-            action = initial_sequence[0]
-            initial_sequence.pop(0)
+            action = initial_sequence.pop(0)
             if not len(initial_sequence):
                 mapper.one_map.reset_checked_map()
         elif autonomous:
             action = None
-            # print("Goal pos: ", goal_pos)
 
             state = sim.get_agent(0).get_state()
             orientation = state.rotation
@@ -148,7 +146,7 @@ if __name__ == "__main__":
             yaw = pitch
             current_pos = np.array([[-state.position[2]], [-state.position[0]], [state.position[1]]])
             path = mapper.get_path()
-            # rr.log("map/path", rr.LineStrips2D(path))
+
             if path and len(path) > 1:
                 path = Planning.simplify_path(np.array(path))
                 path = path.astype(np.float32)
@@ -163,7 +161,7 @@ if __name__ == "__main__":
 
         state = sim.get_agent(0).get_state()
         pos = np.array(([[-state.position[2]], [-state.position[0]], [state.position[1]]]))
-        # print(pos)
+
         mapper.set_camera_matrix(K)
         orientation = state.rotation
         q0 = orientation.x
@@ -191,9 +189,11 @@ if __name__ == "__main__":
             rr.log("camera/rgb", rr.Image(observations["rgb"]))
             rr.log("camera/depth", rr.Image((observations["depth"] - observations["depth"].min()) / (
                     observations["depth"].max() - observations["depth"].min())))
+            rr.log("camera/target", rr.Points2D(positions=[[125, 10]], labels=[f"Target: {mapper.query_text[0]}"], colors=[[255,255,255]]))
             logger.log_map()
             logger.log_pos(cam_x, cam_y)
         if obj_found:
-            mapper.set_query([qs[0]])
-            qs.pop(0)
-            continue
+            if not len(qs):
+                running = False
+                continue
+            mapper.set_query([qs.pop(0)])
