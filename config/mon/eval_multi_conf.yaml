@@ -6,6 +6,7 @@ EvalConf:
   object_nav_path: "datasets/multiobject_episodes/"
   scene_path: "datasets/scene_datasets/"
   log_rerun: True
+  n_agents: 2
   use_pointnav: False
   square_im: True
 

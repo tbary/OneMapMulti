@@ -30,7 +30,7 @@ class Controller(ABC):
 
 
 class HabitatController(Controller):
-    def __init__(self, sim, config: HabitatControllerConf):
+    def __init__(self, sim: habitat_sim.Simulator, config: HabitatControllerConf):
         self.sim = sim
         self.vel_control = habitat_sim.physics.VelocityControl()
         self.vel_control.controlling_lin_vel = True
@@ -69,7 +69,7 @@ class HabitatController(Controller):
 
         return angular_velocity, linear_velocity
 
-    def control(self, pos, yaw, path, own_update=True):
+    def control(self, agent_id, pos, yaw, path, own_update=True):
         """
         Executes the habitat control logic for the agent
         :param pos: np.ndarray of shape [2, ], pos in metric units
@@ -111,7 +111,7 @@ class HabitatController(Controller):
                 self.vel_control.linear_velocity = np.array([0.0, -self.max_vel/5.0, 0.0])
             else:
                 return np.array([0.0, 0.0, 0.0]), np.array([0.0, 0.0, 0.0])
-        agent_state = self.sim.get_agent(0).state
+        agent_state = self.sim.get_agent(agent_id).state
         previous_rigid_state = habitat_sim.RigidState(
             utils.quat_to_magnum(agent_state.rotation), agent_state.position
         )
@@ -132,7 +132,7 @@ class HabitatController(Controller):
         agent_state.rotation = utils.quat_from_magnum(
             target_rigid_state.rotation
         )
-        self.sim.get_agent(0).set_state(agent_state)
+        self.sim.get_agent(agent_id).set_state(agent_state)
         self.sim.step_physics(self.time_step)
 
 

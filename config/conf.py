@@ -11,6 +11,7 @@ class Conf:
     mapping: MappingConf
     planner: PlanningConf
     log_rerun: bool
+    n_agents: int
 
 
 def load_config():

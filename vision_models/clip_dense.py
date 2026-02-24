@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from typing import List, Optional
 
 try:
-    import tensorrt as trt
+    import tensorrt as trt # type: ignore
 except:
     print("TensorRT not available, cannot use Jetson")
 

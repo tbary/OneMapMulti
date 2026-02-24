@@ -9,6 +9,7 @@ class EvalConf:
     max_steps: int
     max_dist: float
     log_rerun: bool
+    n_agents: int
     is_gibson: bool
     controller: HabitatControllerConf
     mapping: MappingConf

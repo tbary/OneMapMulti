@@ -5,4 +5,3 @@ services:
       - type: bind
         source: ${HM3D_PATH:-/dev/null}
         target: /onemap/datasets/versioned_data
-        read_only: true

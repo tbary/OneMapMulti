@@ -115,6 +115,7 @@ class MONActor(Actor):
                 else:
                     path = Planning.simplify_path(np.array(path))
                     path = np.array(path).astype(np.float32)
+                    raise NotImplementedError("Not adapted to multiagents!")
                     rr.log("map/path_simplified",  rr.LineStrips2D(rotate_frame(path), colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
                                                                                 path.shape[0], axis=0)))
                     for i in range(path.shape[0]):

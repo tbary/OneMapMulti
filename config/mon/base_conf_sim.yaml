@@ -4,6 +4,7 @@
 Conf:
   controller: HabitatControllerConf
   log_rerun: True
+  n_agents: 2
 config: [
   ./controller_spot.yaml,          # Default Spot Configuration,
   ./controller_habitat.yaml, # Default Habitat Controller THIS ONE WILL BE USED

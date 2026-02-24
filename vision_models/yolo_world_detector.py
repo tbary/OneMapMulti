@@ -38,7 +38,6 @@ class YOLOWorldDetector:
         }
 
         for detection in results.predictions:
-            cls = detection.class_id
             class_name = detection.class_name
 
             if class_name == self.classes[0] and detection.confidence > self.confidence_threshold:

@@ -139,6 +139,7 @@ class OneMap:
 
         self.camera_initialized = False
         self.agent_height_0 = None
+        self.previous_sims = None
 
         self.kernel_half = int(np.round(config.blur_kernel_size / self.cell_size))
         self.kernel_size = self.kernel_half * 2 + 1
@@ -197,6 +198,9 @@ class OneMap:
         # Reset iteration counter
         self._iters = 0
         self.agent_height_0 = None
+
+        # Reset previous sims
+        self.previous_sims = None
 
     def reset_updated_mask(self):
         self.updated_mask = torch.zeros((self.n_cells, self.n_cells), dtype=torch.bool).to(self.map_device)
@@ -311,11 +315,20 @@ class OneMap:
                                                 self.navigable_kernel, iterations=1).astype(bool)
 
 
-            self.fully_explored_map = (np.nan_to_num(1.0 / self.confidence_map.cpu().numpy())
+            self.fully_explored_map = (np.nan_to_num(1.0 / (self.confidence_map.cpu().numpy() + 1e-8))
                                        < self.fully_explored_threshold)
 
-            self.checked_map = (np.nan_to_num(1.0 / self.checked_conf_map.cpu().numpy())
+            self.checked_map = (np.nan_to_num(1.0 / (self.checked_conf_map.cpu().numpy() + 1e-8))
                                 < self.checked_map_threshold)
+
+    def get_similarity_map(self) -> np.ndarray:
+        return self.previous_sims.cpu().numpy()
+
+    def set_similarity_map(self, similarity_map: torch.Tensor|None, mask: np.ndarray|None = None) -> None:
+        if mask is not None:
+            self.previous_sims[:, mask] = similarity_map
+        else:
+            self.previous_sims = similarity_map
 
     @torch.no_grad()
     # @torch.compile
@@ -324,7 +337,7 @@ class OneMap:
                       depth: torch.Tensor,
                       tf_camera_to_episodic: torch.Tensor,
                       fx, fy, cx, cy
-                      ) -> (torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor):
+                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Projects the dense features into the map
         TODO We could get rid of sparse tensors entirely and instead use arrays of indices and values to reduce overhead
@@ -515,7 +528,7 @@ class OneMap:
                        depth: np.ndarray,
                        tf_camera_to_episodic,
                        fx, fy, cx, cy
-                       ) -> (torch.Tensor, torch.Tensor):
+                       ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Projects a single value observation into the map using a heuristic, similar to VLFM
         :param values:
