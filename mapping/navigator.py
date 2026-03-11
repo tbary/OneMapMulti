@@ -239,7 +239,7 @@ class Navigator:
             if t in self.class_map:
                 txt[txt.index(t)] = self.class_map[t]
         if txt != self.query_text:
-            print(f"Setting query of agent {self.agent_id} to {txt}")
+            # print(f"Setting query of agent {self.agent_id} to {txt}")
             self.query_text = txt
             self.query_text_features = self.model.get_text_features(["a " + self.query_text[0]]).to(self.one_map.map_device)
 
@@ -459,7 +459,7 @@ class Navigator:
                     pts = np.array([nav_goal.get_descr_point() for nav_goal in self.nav_goals])
                     scores = np.array([nav_goal.get_score() for nav_goal in self.nav_goals])
                     rr.log("map/frontiers",
-                           rr.Points2D(pts, colors=np.flip(monochannel_to_inferno_rgb(scores), axis=-1),
+                           rr.Points2D(rotate_frame(pts), colors=np.flip(monochannel_to_inferno_rgb(scores), axis=-1),
                                        radii=[1] * pts.shape[0]))
 
             self.nav_goals = sorted(self.nav_goals, key=lambda x: x.get_score(), reverse=True)
@@ -595,7 +595,7 @@ class Navigator:
                     adjusted_score = self.one_map.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
                     if self.log:
                         rr.log(f"map/agent_{self.agent_id}/proj_detect",
-                               rr.Points2D(np.stack((x_id, y_id)).T, colors=[[0, 0, 255]], radii=[1]))
+                               rr.Points2D(np.stack((y_id, x_id)).T, colors=[[0, 0, 255]], radii=[1]))
                         # log the segmentation mask as rgba
                         rr.log(f"agent_{self.agent_id}/camera/mask", rr.SegmentationImage(masks[0].astype(np.uint8)))
 
@@ -627,6 +627,7 @@ class Navigator:
         else:
             if self.log:
                 rr.log(f"agent_{self.agent_id}/camera/detection", rr.Clear(recursive=True))
+                rr.log(f"map/agent_{self.agent_id}/proj_detect", rr.Clear(recursive=True))
             if not self.object_detected:
                 self.chosen_detection = None
 
@@ -662,8 +663,8 @@ class Navigator:
             return True
         self.last_pose = (px, py, yaw)
 
-        if time.time() - t0 > 4:
-            raise RuntimeError()
+        # if time.time() - t0 > 4:
+        #     raise RuntimeError()
 
     def update_map(self, reset=False) -> None:
         """updates the similarity map given the query text"""

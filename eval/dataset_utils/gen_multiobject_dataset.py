@@ -330,7 +330,7 @@ def load_all_scene_data(sc, scenes, scene_data, viewpoint_conf, sim = None):
         sim = build_sim(path_to_hm3d_v0_2, sc, start_poses_tilt_angle, True)
     # we load all the objects of interest in the semantic scene
     scene_data = HM3DDataset.load_hm3d_objects(scene_data, sim.semantic_scene.objects, sc)
-    print(sum(len(scene_data[sc].object_locations[cat]) for cat in scene_data[sc].object_locations.keys()))
+    # print(sum(len(scene_data[sc].object_locations[cat]) for cat in scene_data[sc].object_locations.keys()))
     # we go through the floors of the scene and add the object locations to it
     sc_short = sc.split("/")[-1].split(".")[0]
     if os.path.exists(os.path.join(viewpoint_dir, f"{sc_short}_viewpoints.json")):

@@ -1,3 +1,7 @@
+import os
+os.environ["HABITAT_SIM_LOG"] = "quiet"
+os.environ["MAGNUM_LOG"] = "error"
+
 from eval.habitat_multi_evaluator import HabitatMultiEvaluator
 from config import load_eval_config
 from eval.actor import MONActor

@@ -11,7 +11,7 @@ from queue import PriorityQueue
 from heapq import *
 
 from dataclasses import dataclass, field
-from typing import Any, List
+from typing import Any, Union
 import matplotlib.pyplot as plt
 import random
 
@@ -28,7 +28,7 @@ def compute_reachable_area_score(start: np.ndarray,
                                  mask_coverage: np.ndarray,
                                  scores: np.ndarray,
                                  max_depth: int
-                                 ) -> (float, int, np.ndarray):
+                                 ) -> Union[float, int, np.ndarray]:
     """
     Compute the score and number of visited nodes for a given start position (optimized version)
     :param start: start position in pixel coordinates

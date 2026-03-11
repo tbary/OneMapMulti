@@ -5,7 +5,7 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
-from mapping import Navigator, OneMap
+from mapping import OneMap
 from onemap_utils import log_map_rerun
 
 
@@ -16,25 +16,22 @@ def log_pos(x, y, agent):
 def rotate_frame(points):
     return [[y, x] for (x, y) in points]
 
-def setup_blueprint_debug():
+def setup_blueprint_debug(n_agents):
     my_blueprint = rrb.Blueprint(
         rrb.Horizontal(
-            rrb.Vertical(
-                rrb.Spatial2DView(origin="camera",
-                                  name="rgb",
-                                  contents=["$origin/rgb",
-                                            "$origin/detection"], ),
-                rrb.Spatial2DView(origin="camera/depth")
-            ),
+            *[rrb.Vertical(
+                rrb.Spatial2DView(
+                    origin=f"agent_{i}/camera",
+                    name=f"agent_{i}_rgb",
+                    contents=["$origin/rgb", "$origin/detection", "$origin/target"], 
+                ),
+                rrb.Spatial2DView(origin=f"agent_{i}/camera/depth", name=f"agent_{i}_depth")
+            ) for i in range(n_agents)],
             rrb.Vertical(
                 rrb.Vertical(
                     rrb.TextLogView(origin="object_detections"),
                     rrb.TextLogView(origin="path_updates"),
                 ),
-                rrb.Spatial2DView(origin="map",
-                                  name="Traversable",
-                                  contents=["$origin/traversable",
-                                            "$origin/position"], ),
             ),
             rrb.Vertical(
                 rrb.Tabs(
@@ -42,51 +39,42 @@ def setup_blueprint_debug():
                                         name="Similarity",
                                         contents=
                                         ["$origin/similarity/",
-                                         "$origin/proj_detect",
                                          "$origin/frontiers",
-                                         "$origin/frontiers_far",
-                                         "$origin/position"]),
+                                        *[f"$origin/agent_{i}/proj_detect" for i in range(n_agents)],
+                                        *[f"$origin/agent_{i}/position" for i in range(n_agents)]]),
                       rrb.Spatial2DView(origin="map",
                                         name="SimilarityTresholded",
                                         contents=
                                         ["$origin/similarity_th/",
-                                         "$origin/proj_detect",
-                                         "$origin/position"]),
+                                         *[f"$origin/agent_{i}/proj_detect" for i in range(n_agents)],
+                                         *[f"$origin/agent_{i}/position" for i in range(n_agents)]]),
                       rrb.Spatial2DView(origin="map",
                                         name="SimilarityTresholdedCl",
                                         contents=
                                         ["$origin/similarity_th2/",
-                                         "$origin/proj_detect",
-                                         "$origin/position"]),
+                                         *[f"$origin/agent_{i}/proj_detect" for i in range(n_agents)],
+                                         *[f"$origin/agent_{i}/position" for i in range(n_agents)]]),
                       ],
                 ),
                 rrb.Tabs(
                     rrb.Spatial2DView(origin="map",
                                       name="Explored",
                                       contents=["$origin/explored",
-                                                "$origin/position",
-                                                "$origin/proj_detect",
-                                                "$origin/goal_pos",
                                                 "$origin/largest_contour",
-                                                "$origin/frontier_lines",
-                                                "$origin/path",
-                                                "$origin/path_simplified",
                                                 "$origin/ground_truth",
                                                 "$origin/frontiers",
-                                                "$origin/frontiers_far", ]),
-                    rrb.Spatial2DView(origin="map",
-                                      name="Scores",
-                                      contents=["$origin/scores",
-                                                "$origin/position",
-                                                "$origin/goal_pos",
-                                                "$origin/path"]),
+                                                *[f"$origin/agent_{i}/position" for i in range(n_agents)],
+                                                *[f"$origin/agent_{i}/goal_pos" for i in range(n_agents)],
+                                                *[f"$origin/agent_{i}/path" for i in range(n_agents)],
+                                                *[f"$origin/agent_{i}/path_simplified" for i in range(n_agents)],
+                                                *[f"$origin/agent_{i}/proj_detect" for i in range(n_agents)],
+                                            ]),
                     rrb.Spatial2DView(origin="map",
                                       name="Unexplored",
                                       contents=["$origin/frontiers",
-                                                "$origin/frontiers_far",
                                                 "$origin/largest_contour",
-                                                "$origin/position",
-                                                "$origin/unexplored"]),
+                                                "$origin/unexplored",
+                                                *[f"$origin/agent_{i}/position" for i in range(n_agents)]]),
                 ),
             ),
         ),
@@ -119,16 +107,10 @@ def setup_blueprint(n_agents):
                         name="Explored",
                         contents=[
                             "$origin/explored",
-                            *[
-                                item
-                                for i in range(n_agents)
-                                for item in [
-                                    f"$origin/agent_{i}/position",
-                                    f"$origin/agent_{i}/goal_pos",
-                                    f"$origin/agent_{i}/path",
-                                    f"$origin/agent_{i}/path_simplified",
-                                ]
-                            ]
+                            *[f"$origin/agent_{i}/position" for i in range(n_agents)],
+                            *[f"$origin/agent_{i}/goal_pos" for i in range(n_agents)],
+                            *[f"$origin/agent_{i}/path" for i in range(n_agents)],
+                            *[f"$origin/agent_{i}/path_simplified" for i in range(n_agents)],
                         ]
                     ),
                 ),
@@ -152,7 +134,6 @@ class RerunLogger:
             rr.connect_grpc("rerun+http://127.0.0.1:9876/proxy")
 
         if self.debug_log:
-            raise NotImplementedError("setup_blueprint_debug must be adapted to multi agents!")
             setup_blueprint_debug(self.n_agents)
         else:
             setup_blueprint(self.n_agents)

@@ -110,9 +110,8 @@ class YOLOv7Detector:
                     if not (box[0].item() == box[2].item() or box[1].item() == box[3].item()):
                         preds["boxes"].append([box[0].item(), box[1].item(), box[2].item(), box[3].item()])
                         preds["scores"].append(logits[i])
-                        print(logits[i])
 
-        print(f"YOLO forward: {time.time() - a}")
+        # print(f"YOLO forward: {time.time() - a}")
         return preds
 
 if __name__ == "__main__":

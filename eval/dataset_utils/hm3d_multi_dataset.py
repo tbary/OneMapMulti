@@ -47,7 +47,6 @@ def load_hm3d_multi_episodes(episodes: List[Episode], scene_data: Dict[str, Scen
                             scene_data_.object_ids[obj] = []
                     i += 1
                 scene_data[scene_id] = scene_data_
-
     return episodes, scene_data
 
 

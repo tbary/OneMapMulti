@@ -33,8 +33,6 @@ class Frontier(NavGoal):
     def get_descr_point(self):
         return self.frontier_midpoint
 
-
-
 def _bresenhamline_nslope(slope):
     """
     Normalize slope for Bresenham's line algorithm.
@@ -222,14 +220,14 @@ def detect_frontiers(
         cont_log = largest_contour.transpose(1, 0, 2)
         cont_log = np.flip(cont_log, axis=-1)
         cont_ret = np.flip(largest_contour, axis=-1)
-        rr.log("map/largest_contour", rr.LineStrips2D(cont_log))
+        rr.log("map/largest_contour", rr.LineStrips2D(cont_log[...,::-1]))
         frontiers = contour_to_frontiers(
             interpolate_contour(largest_contour), cv2.blur(  # blurring for some leeway
                     full_map, (3, 3)
                 )
         )
-    else:
-        print("No frontiers found")
+    # else:
+    #     print("No frontiers found")
 
 
     return frontiers, unexplored_mask, cont_ret
