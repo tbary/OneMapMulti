@@ -15,7 +15,7 @@ from vision_models.yolo_world_detector import YOLOWorldDetector
 # from vision_models.yolov6_model import YOLOV6Detector
 from vision_models.yolov7_model import YOLOv7Detector
 
-from mapping import Navigator, OneMap
+from mapping import Navigator, OneMap, Projection, rotate_frame
 from planning import Planning, Controllers
 # scipy
 from scipy.spatial.transform import Rotation as R
@@ -33,11 +33,13 @@ def _gen_camera_matrix(hfov, res_x, res_y):
         [0, 0, 1]
     ])
 
-def _transformation_matrix(pos, orientation):
-    q0 = orientation.x
-    q1 = orientation.y
-    q2 = orientation.z
-    q3 = orientation.w
+def _transformation_matrix(state):
+    pos = np.array(([[-state.position[2]], [-state.position[0]], [state.position[1]]]))
+
+    q0 = state.rotation.x
+    q1 = state.rotation.y
+    q2 = state.rotation.z
+    q3 = state.rotation.w
 
     r = R.from_quat([q0, q1, q2, q3])
     # r to euler
@@ -49,9 +51,6 @@ def _transformation_matrix(pos, orientation):
     transformation_matrix = np.vstack((transformation_matrix, np.array([0, 0, 0, 1])))
 
     return yaw, transformation_matrix
-
-def rotate_frame(points):
-    return [[y, x] for (x, y) in points]
 
 class Actor(ABC):
     @abstractmethod
@@ -67,7 +66,6 @@ class Actor(ABC):
     def set_query(self, query: str):
         pass
 
-
 class MONActor(Actor):
     one_map: OneMap
     mappers: list[Navigator]
@@ -77,70 +75,84 @@ class MONActor(Actor):
             else YOLOv7Detector(config.planner.yolo_confidence)
 
         self.n_agents = config.n_agents
-        self.policy = None
-        self.action_lookup = [None, 'move_forward', 'turn_left', 'turn_right']
-
         self.init = 36*2 * config.n_agents
 
-        self.one_map = OneMap(model.feature_dim, config.mapping, map_device="cpu")
-        self.mappers = [Navigator(model, detector, self.one_map, config, agent_id) for agent_id in range(config.n_agents)]
+        self.one_map = OneMap(config.n_agents, model.feature_dim, config.mapping, map_device="cpu")
+        self.projection = Projection(model.feature_dim, config.mapping)
+        self.mappers = [Navigator(model, detector, self.one_map, self.projection, config, agent_id) for agent_id in range(config.n_agents)]
         
         K = _gen_camera_matrix(90 if config.square_im else 97, 640, 640 if config.square_im else 480)
         for mapper in self.mappers:
-            mapper.set_camera_matrix(K)
+            mapper.projection.set_camera_matrix(K)
         self.controller = Controllers.HabitatController(None, config.controller)
 
     # consider that obs has the obs for all the agents
     def act(self, observations: Dict[str, any]) -> Tuple[Dict, bool]:
+        # Observe
+        obj_detected = np.zeros(len(self.mappers), dtype=bool)
+        for a, mapper in enumerate(self.mappers):
+            image = observations[a]["rgb"][..., :-1].transpose(2, 0, 1)
+            depth = observations[a]["depth"].astype(np.float32)
+            odometry = _transformation_matrix(observations[a]["state"])[1].astype(np.float32)
+
+            yaw = np.arctan2(odometry[1, 0], odometry[0, 0])
+            current_pos = np.array(self.projection.metric_to_px(odometry[0, 3], odometry[1, 3]), dtype=int)
+            mapper.one_map.update_agent_pose((*current_pos,yaw), mapper.agent_id)
+            mapper.add_data(image, depth, odometry)
+            obj_detected[a] = mapper.check_object_in_image(image, depth, odometry)
+        nav_goals = self.one_map.compute_frontiers_and_POIs()
+        assigned_nav_goals = self.one_map.split_frontiers_and_POIs(obj_detected, nav_goals)
+
+        # Plan
+        obj_found = -1
+        for a, mapper in enumerate(self.mappers):
+            odometry = _transformation_matrix(observations[a]["state"])[1].astype(np.float32)
+            current_pos = np.array(self.projection.metric_to_px(odometry[0, 3], odometry[1, 3]), dtype=int)
+
+            if self.init == 0:
+                if mapper.object_detected:
+                    obj_found = max(mapper.check_object_reached(current_pos), obj_found)
+
+                elif mapper.config.planner.allow_replan and len(assigned_nav_goals[a]):
+                    mapper.compute_best_path_to_frontier(current_pos, assigned_nav_goals[a])
+
+            yaw = np.arctan2(odometry[1, 0], odometry[0, 0])
+            mapper.last_pose = (*current_pos, yaw)
+
+        # Act on plans
         return_act = defaultdict(lambda:defaultdict(dict))
-        obj_found = False
         for a, mapper in enumerate(self.mappers):
             state = observations[a]["state"]
-
-            pos = np.array(([[-state.position[2]], [-state.position[0]], [state.position[1]]]))
-            yaw, transformation_matrix = _transformation_matrix(pos, state.rotation)
-            
-            obj_found = obj_found or mapper.add_data(
-                observations[a]["rgb"][:, :, :-1].transpose(2, 0, 1),
-                observations[a]["depth"].astype(np.float32),
-                transformation_matrix
-            )
             if self.init > 0:
                 return_act['discrete'][a] = 'turn_left'
                 self.init -= 1
             else:
-                path = mapper.get_path()
-                if isinstance(path, str):
-                    if path == "L":
-                        return_act['discrete'][a] = 'turn_left'
-                        continue
-                    elif path == "R":
-                        return_act['discrete'][a] = 'turn_right'
-                        continue
+                path = mapper.path
 
                 if path and len(path) > 0:
-                    if self.policy is not None:
-                        goal_pt = self.one_map.px_to_metric(path[-1][0], path[-1][1])
-                        action = self.policy.act(observations[a]['depth'], pos[:2, 0], yaw, goal_pt)
-                        # action 2 means turn left, action 3 means turn right action 1 means move forward?
-                        return_act['discrete'][a] = self.action_lookup[action.item()]
-                    else:
-                        path = Planning.simplify_path(np.array(path))
-                        path = np.array(path).astype(np.float32)
-                        rr.log(f"map/agent_{a}/path_simplified",  rr.LineStrips2D(
-                            rotate_frame(path), 
-                            colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
-                            path.shape[0], axis=0)
-                        ))
-                        for i in range(path.shape[0]):
-                            path[i, :] = self.one_map.px_to_metric(path[i, 0], path[i, 1])
-                        ang, lin = self.controller.control(a, pos, yaw, path, False)
-                        return_act['continuous']['linear'][a] = lin
-                        return_act['continuous']['angular'][a] = ang
+                    path = Planning.simplify_path(np.array(path))
+                    path = np.array(path).astype(np.float32)
+                    rr.log(f"map/agent_{a}/path_simplified",  rr.LineStrips2D(
+                        rotate_frame(path), 
+                        colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
+                        path.shape[0], axis=0)
+                    ))
+                    for i in range(path.shape[0]):
+                        path[i, :] = self.projection.px_to_metric(path[i, 0], path[i, 1])
+                    pos = np.array(([[-state.position[2]], [-state.position[0]], [state.position[1]]]))
+                    yaw, _ = _transformation_matrix(state)
+                    ang, lin = self.controller.control(a, pos, yaw, path, False)
+                    return_act['continuous'][a]['linear'] = lin
+                    return_act['continuous'][a]['angular'] = ang
+
                 else:
                     return_act['discrete'][a] = 'move_forward'
+        
+        if obj_found != -1:
+            for mapper in self.mappers:
+                mapper.last_nav_goal = None
 
-        return return_act, obj_found
+        return return_act, obj_found, nav_goals
 
     def reset(self):
         for mapper in self.mappers:

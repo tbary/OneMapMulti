@@ -5,7 +5,7 @@ EvalConf:
   is_gibson: False
   object_nav_path: "datasets/multiobject_episodes/"
   scene_path: "datasets/scene_datasets/"
-  results_path: "results_multi/"
+  results_path: "results_multi_one/"
   log_rerun: True
   n_agents: 1
   use_pointnav: False

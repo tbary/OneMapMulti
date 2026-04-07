@@ -9,6 +9,12 @@ from eval.actor import MONActor
 def main():
     # Load the evaluation configuration
     eval_config = load_eval_config()
+
+    base_path = eval_config.EvalConf.results_path
+    os.makedirs(os.path.join(base_path, "similarities"), exist_ok=True)
+    os.makedirs(os.path.join(base_path, "state"), exist_ok=True)
+    os.makedirs(os.path.join(base_path, "trajectories"), exist_ok=True)
+
     # Create the HabitatEvaluator object
     evaluator = HabitatMultiEvaluator(eval_config.EvalConf, MONActor(eval_config.EvalConf))
     evaluator.evaluate()

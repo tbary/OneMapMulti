@@ -1,6 +1,5 @@
 PlanningConf:
   percentile_exploitation: 99.0  # in percents [in navigator.py]
-  frontier_depth: 2.5  # in meters  [in navigator.py]
   no_nav_radius: 0.9 # in meters  [in navigator.py]
 #  yolo_confidence: 0.5 # [in yolo_world_detector.py]
   yolo_confidence: 0.8 # [in yolo_world_detector.py]

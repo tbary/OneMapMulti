@@ -3,41 +3,41 @@ This is the core mapping module, which contains the OneMap class.
 """
 from transforms3d.derivations.angle_axes import point
 
-from mapping import (precompute_gaussian_kernel_components,
-                     precompute_gaussian_sum_els, gaussian_kernel_sum,
-                     compute_gaussian_kernel_components,
-                     detect_frontiers,
-                     )
+from .nav_goals.frontier import Frontier, detect_frontiers, get_frontier_midpoint
+from .nav_goals.clustering import Cluster, cluster_high_similarity_regions
+from .nav_goals.navigation_goals import NavGoal
+from .projection import Projection
+
 from config import MappingConf
+from planning import Planning
+from onemap_utils import monochannel_to_inferno_rgb, log_map_rerun, log_dino_embeddings_tsne
 
-from onemap_utils import ceildiv
 
-import time
+from skimage.measure import label
+from scipy.ndimage import distance_transform_edt
 
 # enum
 from enum import Enum
 
 # NumPy
 import numpy as np
+import scipy.optimize
 
 # typing
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Union, Set, Dict
 
 # rerun
 import rerun as rr
 
 # torch
 import torch
-
-# warnings
-import warnings
+from torch.nn.functional import normalize
 
 # cv2
 import cv2
 
-# functools
-from functools import wraps
-
+def rotate_frame(points):
+    return [[y, x] for (x, y) in points]
 
 def rotate_pcl(
         pointcloud: torch.Tensor,
@@ -58,15 +58,9 @@ def print_memory_stats(label):
     print(f"Cached: {torch.cuda.memory_reserved() / 1e6:.2f} MB")
     print(f"Max Allocated: {torch.cuda.max_memory_allocated() / 1e6:.2f} MB")
 
-class DenseProjectionType(Enum):
-    INTERPOLATE = "interpolate"
-    SUBSAMPLE = "subsample"
-
-
 class FusionType(Enum):
     EMA = "EMA"
     SPATIAL = "Spatial"
-
 
 class OneMap:
     feature_map: torch.Tensor  # map where first dimension is x direction, second dimension is y, and last direction is
@@ -81,153 +75,106 @@ class OneMap:
     confidence_map: torch.Tensor
     checked_conf_map: torch.Tensor
     updated_mask: torch.Tensor  # tracks which cells have been updated, for lazy similarity computation
+    blacklisted_nav_goals: List[np.ndarray]
+    nav_goals: List[NavGoal]
+    last_nav_goal: Union[NavGoal, None]
 
     def __init__(self,
+                 n_agents: int,
                  feature_dim: int,
                  config: MappingConf,
-                 dense_projection: DenseProjectionType = DenseProjectionType.INTERPOLATE,
                  fusion_type: FusionType = FusionType.EMA,
                  map_device: str = "cuda",
                  ) -> None:
         """
-
         :param feature_dim: The dimension of the feature space
         :param n_cells: The number of cells in the x and y direction respectively
         :param size: The size of the map in meters
-        :param dense_projection: The type of dense projection to use, must be one of DenseProjectionType
         :param fusion_type: The type of fusion to use, must be one of FusionType
         """
-        assert isinstance(dense_projection,
-                          DenseProjectionType), "Invalid dense_projection. It should be one of DenseProjection."
         assert isinstance(fusion_type, FusionType), "Invalid fusion_type. It should be one of FusionType."
 
-        self.dense_projection = dense_projection
+        self.config = config
+
         self.fusion_type = fusion_type
         self.map_device = map_device
 
-        self.n_cells = config.n_points
-        self.map_center_cells = self.map_center_cells = torch.tensor([self.n_cells // 2, self.n_cells // 2],
-                                                                     dtype=torch.int32).to("cuda")
-        self.size = config.size
-        self.cell_size = self.size / self.n_cells
+        self.cell_size = self.config.size / self.config.n_points
         self.feature_dim = feature_dim
-        self.feature_map = torch.zeros((self.n_cells, self.n_cells, feature_dim), dtype=torch.float32)
-        self.feature_map = self.feature_map.to(self.map_device)
+        self.feature_map = torch.zeros((self.config.n_points, self.config.n_points, feature_dim), dtype=torch.float32).to(self.map_device)
 
-        self.obstacle_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32)
-        self.agent_radius = config.agent_radius
-        col_kernel_size = self.n_cells / self.size * self.agent_radius
+        self.obstacle_map = torch.zeros((self.config.n_points, self.config.n_points), dtype=torch.float32)
+        col_kernel_size = self.config.n_points / self.config.size * self.config.agent_radius
         col_kernel_size = int(col_kernel_size) + (int(col_kernel_size) % 2 == 0)
-        self.navigable_map = np.ones((self.n_cells, self.n_cells), dtype=bool)
-        self.occluded_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
+        self.navigable_map = np.ones((self.config.n_points, self.config.n_points), dtype=bool)
+        self.occluded_map = np.zeros((self.config.n_points, self.config.n_points), dtype=bool)
         self.navigable_kernel = np.ones((col_kernel_size, col_kernel_size), np.uint8)
 
-        self.fully_explored_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
-        self.checked_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
+        self.blacklisted_nav_goals = []
+        self.frontier_depth = int(config.frontier_depth / self.cell_size)
 
-        self.confidence_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32)
-        self.confidence_map = self.confidence_map.to(self.map_device)
-        self.checked_conf_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32)
-        self.checked_conf_map = self.checked_conf_map.to(self.map_device)
+        self.fully_explored_map = np.zeros((self.config.n_points, self.config.n_points), dtype=bool)
+        self.checked_map = np.zeros((self.config.n_points, self.config.n_points), dtype=bool)
 
-        self.updated_mask = torch.zeros((self.n_cells, self.n_cells), dtype=torch.bool).to(self.map_device)
+        self.confidence_map = torch.zeros((self.config.n_points, self.config.n_points), dtype=torch.float32).to(self.map_device)
+        self.checked_conf_map = torch.zeros((self.config.n_points, self.config.n_points), dtype=torch.float32).to(self.map_device)
 
-        self.fx = None
-        self.fy = None
-        self.cx = None
-        self.cy = None
+        self.updated_mask = torch.zeros((self.config.n_points, self.config.n_points), dtype=torch.bool).to(self.map_device)
 
-        self.camera_initialized = False
-        self.agent_height_0 = None
-        self.previous_sims = None
+        self.agents_poses = np.zeros((n_agents, 3))
 
-        self.kernel_half = int(np.round(config.blur_kernel_size / self.cell_size))
-        self.kernel_size = self.kernel_half * 2 + 1
-        self.kernel_components_sum = precompute_gaussian_sum_els(self.kernel_size).to("cuda")
-        self.kernel_components = precompute_gaussian_kernel_components(self.kernel_size).to("cuda")
-        self.kernel_ids = torch.arange(-self.kernel_half, self.kernel_half + 1).to("cuda")
-        self.kernel_ids_x, self.kernel_ids_y = torch.meshgrid(self.kernel_ids, self.kernel_ids)
-        self.kernel_ids_x = self.kernel_ids_x.unsqueeze(0)
-        self.kernel_ids_y = self.kernel_ids_y.unsqueeze(0)
-        print("ValueMap initialized. The map contains {} cells, each storing {} features. The resulting"
-              " size is {} Mb".format(self.n_cells ** 2, feature_dim, self.feature_map.element_size() *
-                                      self.feature_map.nelement() / 1024 / 1024))
+        self.similarity_map = None
+        self.initializing = True
 
-        self.obstacle_map_threshold = config.obstacle_map_threshold
-        self.fully_explored_threshold = config.fully_explored_threshold
-        self.checked_map_threshold = config.checked_map_threshold
-        self.depth_factor = config.depth_factor
-        self.gradient_factor = config.gradient_factor
-        self.optimal_object_distance = config.optimal_object_distance
-        self.optimal_object_factor = config.optimal_object_factor
-        self.obstacle_min = config.obstacle_min
-        self.obstacle_max = config.obstacle_max
-        self.filter_stairs = config.filter_stairs
-        self.floor_threshold = config.floor_threshold
-        self.floor_level = config.floor_level
-
-        self._iters = 0
+        print(f"ValueMap initialized. The map contains {self.config.n_points ** 2} cells, each storing {feature_dim} features. The resulting size is {self.feature_map.element_size() * self.feature_map.nelement() / 1024**2} Mb.")
 
     def reset(self):
         # Reset value map
-        self.feature_map = torch.zeros((self.n_cells, self.n_cells, self.feature_dim), dtype=torch.float32).to(
-            self.map_device)
+        self.feature_map = torch.zeros((self.config.n_points, self.config.n_points, self.feature_dim), dtype=torch.float32).to(self.map_device)
 
         # Reset obstacle map
-        self.obstacle_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32).to(self.map_device)
+        self.obstacle_map = torch.zeros((self.config.n_points, self.config.n_points), dtype=torch.float32).to(self.map_device)
 
         # Reset navigable map
-        self.navigable_map = np.ones((self.n_cells, self.n_cells), dtype=bool)
-        self.occluded_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
+        self.navigable_map = np.ones((self.config.n_points, self.config.n_points), dtype=bool)
+        self.occluded_map = np.zeros((self.config.n_points, self.config.n_points), dtype=bool)
 
         # Reset fully explored map
-        self.fully_explored_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
+        self.fully_explored_map = np.zeros((self.config.n_points, self.config.n_points), dtype=bool)
 
         # Reset checked map
-        self.checked_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
+        self.checked_map = np.zeros((self.config.n_points, self.config.n_points), dtype=bool)
 
         # Reset confidence map
-        self.confidence_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32).to(self.map_device)
+        self.confidence_map = torch.zeros((self.config.n_points, self.config.n_points), dtype=torch.float32).to(self.map_device)
 
         # Reset checked confidence map
-        self.checked_conf_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32).to(self.map_device)
+        self.checked_conf_map = torch.zeros((self.config.n_points, self.config.n_points), dtype=torch.float32).to(self.map_device)
 
         # Reset updated mask
-        self.updated_mask = torch.zeros((self.n_cells, self.n_cells), dtype=torch.bool).to(self.map_device)
-
-        # Reset iteration counter
-        self._iters = 0
-        self.agent_height_0 = None
+        self.updated_mask = torch.zeros((self.config.n_points, self.config.n_points), dtype=torch.bool).to(self.map_device)
 
         # Reset previous sims
-        self.previous_sims = None
+        self.similarity_map = None
+        self.initializing = True
+
+        self.agents_poses = np.zeros_like(self.agents_poses)
+
+        self.blacklisted_nav_goals = []
 
     def reset_updated_mask(self):
-        self.updated_mask = torch.zeros((self.n_cells, self.n_cells), dtype=torch.bool).to(self.map_device)
+        self.updated_mask = torch.zeros((self.config.n_points, self.config.n_points), dtype=torch.bool).to(self.map_device)
 
     def reset_checked_map(self):
-        self.checked_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
-        self.checked_conf_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32)
-
-    def set_camera_matrix(self,
-                          camera_matrix: np.ndarray
-                          ) -> None:
-        """
-        Sets the camera matrix for the map
-        :param camera_matrix: 3x3 numpy array representing the camera matrix
-        :return:
-        """
-        self.camera_initialized = True
-        self.fx = camera_matrix[0, 0]
-        self.fy = camera_matrix[1, 1]
-        self.cx = camera_matrix[0, 2]
-        self.cy = camera_matrix[1, 2]
+        self.checked_map = np.zeros((self.config.n_points, self.config.n_points), dtype=bool)
+        self.checked_conf_map = torch.zeros((self.config.n_points, self.config.n_points), dtype=torch.float32)
 
     def update(self,
+               projection: Projection,
                values: torch.Tensor,
                depth: np.ndarray,
                tf_camera_to_episodic: np.ndarray,
-               artifical_obstacles: Optional[List[Tuple[float]]] = None
+               artificial_obstacles: Optional[Set[Tuple[float]]] = []
                ) -> None:
         """
         Updates the map with values by projecting them into the map from depth
@@ -236,33 +183,23 @@ class OneMap:
         :param depth:  numpy array of depth values of shape (h, w)
         :param tf_camera_to_episodic: 4x4 numpy array representing the transformation from camera to episodic
         """
-        assert values.shape[0] == self.feature_dim
-        if not self.camera_initialized:
-            warnings.warn("Camera matrix must be set before updating the map")
-            return
-        if self.agent_height_0 is None:
-            self.agent_height_0 = tf_camera_to_episodic[2, 3] / tf_camera_to_episodic[3, 3]
-        if len(values.shape) == 1 or (values.shape[-1] == 1 and values.shape[-2] == 1):
-            confidences_mapped, values_mapped = self.project_single(values, depth,
-                                                                    tf_camera_to_episodic, self.fx, self.fy,
-                                                                    self.cx, self.cy)
-        elif len(values.shape) == 3:
-            values = values.permute(1, 2, 0)  # feature_dim last for convenience
-            (confidences_mapped, values_mapped,
-             obstacle_mapped, obstcl_confidence_mapped) = self.project_dense(values, torch.Tensor(depth).to("cuda"),
-                                                                             torch.tensor(tf_camera_to_episodic),
-                                                                             self.fx, self.fy,
-                                                                             self.cx, self.cy)
-        else:
-            raise Exception("Provided Value observation of unsupported format")
-        self.fuse_maps(confidences_mapped, values_mapped, obstacle_mapped, obstcl_confidence_mapped, artifical_obstacles)
+        assert values.shape[0] == self.feature_dim, "Feature dimension of image does not correspond to expected dimension."
+        assert len(values.shape) == 3, "Provided Value observation of unsupported format."
 
-    def fuse_maps(self,
+        values = values.permute(1, 2, 0)  # feature_dim last for convenience
+        projected_submap = projection.project_dense(values, torch.Tensor(depth).to("cuda"), torch.tensor(tf_camera_to_episodic))
+
+        self._fuse_maps(*projected_submap, artificial_obstacles)
+
+    def update_agent_pose(self, new_pose, agent_id):
+        self.agents_poses[agent_id] = np.array(new_pose)
+
+    def _fuse_maps(self,
                   confidences_mapped: torch.Tensor,
                   values_mapped: torch.Tensor,
                   obstacle_mapped: torch.Tensor,
                   obstcl_confidence_mapped: torch.Tensor,
-                  artifical_obstacles: Optional[List[Tuple[float]]] = None
+                  artificial_obstacles: Optional[Set[Tuple[float]]] = []
                   ) -> None:
         """
         Fuses the mapped values into the value map using the confidence estimates and tracked confidences
@@ -273,28 +210,28 @@ class OneMap:
         :return:
         """
         if self.fusion_type == FusionType.EMA:
-            indices = confidences_mapped.indices()
-            indices_obstacle = obstacle_mapped.indices()
+            indices = tuple(confidences_mapped.indices())
+            indices_obstacle = tuple(obstacle_mapped.indices())
             confs_new = confidences_mapped.values().data.squeeze()
-            confs_old = self.confidence_map[indices[0], indices[1]]
+            confs_old = self.confidence_map[indices]
 
-            confs_old_obs = self.confidence_map[indices_obstacle[0], indices_obstacle[1]]
+            confs_old_obs = self.confidence_map[indices_obstacle]
 
             confidence_denominator = confs_new + confs_old
             weight_1 = torch.nan_to_num(confs_old / confidence_denominator)
             weight_2 = torch.nan_to_num(confs_new / confidence_denominator)
 
-            self.updated_mask[indices[0], indices[1]] = True
+            self.updated_mask[indices] = True
 
-            self.feature_map[indices[0], indices[1]] = self.feature_map[indices[0], indices[1]] * weight_1.unsqueeze(-1) + \
+            self.feature_map[indices] = self.feature_map[indices] * weight_1.unsqueeze(-1) + \
                                                        values_mapped.values().data * weight_2.unsqueeze(-1)
 
-            self.confidence_map[indices[0], indices[1]] = confidence_denominator
+            self.confidence_map[indices] = confidence_denominator
 
             # we also need to update the checked confidence
-            confs_old_checked = self.checked_conf_map[indices[0], indices[1]]
+            confs_old_checked = self.checked_conf_map[indices]
             confidence_denominator_checked = confs_new + confs_old_checked
-            self.checked_conf_map[indices[0], indices[1]] = confidence_denominator_checked
+            self.checked_conf_map[indices] = confidence_denominator_checked
 
             # Obstacle Map update
             confs_new = obstcl_confidence_mapped.values().data.squeeze()
@@ -302,325 +239,220 @@ class OneMap:
             weight_1 = torch.nan_to_num(confs_old_obs / confidence_denominator)
             weight_2 = torch.nan_to_num(confs_new / confidence_denominator)
 
-            self.obstacle_map[indices_obstacle[0], indices_obstacle[1]] = self.obstacle_map[
-                                                                              indices_obstacle[0], indices_obstacle[
-                                                                                  1]] * weight_1 + \
+            self.obstacle_map[indices_obstacle] = self.obstacle_map[indices_obstacle] * weight_1 + \
                                                                           obstacle_mapped.values().data.squeeze() * weight_2
 
-            self.occluded_map = (self.obstacle_map > self.obstacle_map_threshold).cpu().numpy()
-            if artifical_obstacles is not None:
-                for obs in artifical_obstacles:
-                    self.occluded_map[obs[0], obs[1]] = True
-            self.navigable_map = 1 - cv2.dilate((self.occluded_map).astype(np.uint8),
-                                                self.navigable_kernel, iterations=1).astype(bool)
+            self.occluded_map = (self.obstacle_map > self.config.obstacle_map_threshold).cpu().numpy()
+            if len(artificial_obstacles) != 0:
+                for obs in artificial_obstacles:
+                    self.occluded_map[obs] = True
 
+            self.navigable_map = 1 - cv2.dilate((self.occluded_map).astype(np.uint8), self.navigable_kernel, iterations=1).astype(bool)
 
-            self.fully_explored_map = (np.nan_to_num(1.0 / (self.confidence_map.cpu().numpy() + 1e-8))
-                                       < self.fully_explored_threshold)
-
-            self.checked_map = (np.nan_to_num(1.0 / (self.checked_conf_map.cpu().numpy() + 1e-8))
-                                < self.checked_map_threshold)
-
-    def get_similarity_map(self) -> np.ndarray:
-        return self.previous_sims.cpu().numpy()
+            self.fully_explored_map = (1.0 / (self.confidence_map.cpu().numpy() + 1e-8) < self.config.fully_explored_threshold)
+            self.checked_map = (1.0 / (self.checked_conf_map.cpu().numpy() + 1e-8) < self.config.checked_map_threshold)
 
     def set_similarity_map(self, similarity_map: torch.Tensor|None, mask: np.ndarray|None = None) -> None:
         if mask is not None:
-            self.previous_sims[:, mask] = similarity_map
+            self.similarity_map[mask] = similarity_map
         else:
-            self.previous_sims = similarity_map
+            self.similarity_map = similarity_map
 
-    @torch.no_grad()
-    # @torch.compile
-    def project_dense(self,
-                      values: torch.Tensor,
-                      depth: torch.Tensor,
-                      tf_camera_to_episodic: torch.Tensor,
-                      fx, fy, cx, cy
-                      ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def set_frontiers_exploration_score(self, frontiers:List[Frontier]):
+        discovery_map = self.navigable_map.copy()
+        discovery_map[self.confidence_map.cpu().numpy()==0] = False
+        discovery_map[self.fully_explored_map] = False
+        
+        connected_components = label(discovery_map)
+        connected_components_sizes = np.bincount(connected_components.flatten())
+
+        distances, indices = distance_transform_edt(
+            connected_components == 0,        # background mask
+            return_indices=True
+        )
+
+        for frontier in frontiers:
+            for fc in frontier.points:
+                distance_to_nearest_comp = distances[tuple(fc)]
+                if distance_to_nearest_comp <= 1:
+                    nearest_comp_label = connected_components[tuple(indices[...,fc[0], fc[1]])]
+                    frontier.frontier_explore_score = connected_components_sizes[nearest_comp_label]
+                    break
+        if self.config.log_rerun:
+            log_map_rerun(discovery_map, path="map/discovery")
+
+    def compare_diversity(self, feature_map:np.ndarray, explored_mask:np.ndarray, nav_goal_coords:List[np.ndarray], max_components:int =5, display: bool=False):
+        import time
+        t1 = time.time()
+        # from sklearn.mixture import GaussianMixture
+        # from sklearn.neighbors import KernelDensity
+        # from sklearn.decomposition import PCA
+
+        # explored_map_features = feature_map[explored_mask & (feature_map.sum(axis=-1) != 0.0)]
+        # nav_goal_features = [feature_map[ngc[:, 0], ngc[:, 1]] for ngc in nav_goal_coords]
+
+        # # print(nav_goal_coords.shape, nav_goal_features.shape, explored_map_features.shape)
+        # if display:
+        #     log_dino_embeddings_tsne([explored_map_features, *nav_goal_features], perplexity=min(len(explored_map_features)-5,30))
+
+        # # pca = PCA(n_components=np.min((50, *explored_map_features.shape)), svd_solver='randomized', random_state=42)
+        # # emf_reduced = pca.fit_transform(explored_map_features)
+        
+        # nav_goal_scores = np.empty(len(nav_goal_features))
+        # k = int(np.ceil(0.001*len(explored_map_features)))
+        # for i, ngf in enumerate(nav_goal_features):
+        #     cosine_similarities = np.matmul(explored_map_features, ngf.T)
+        #     point_proximity_scores = np.mean(np.sort(cosine_similarities, axis=0)[-k:], axis=0)
+
+        #     threshold = np.quantile(point_proximity_scores, 0.5)
+        #     filt_point_proximity_scores = point_proximity_scores[point_proximity_scores <= threshold]
+        #     nav_goal_scores[i] = np.mean(filt_point_proximity_scores)
+
+        # candidate = np.argmin(nav_goal_scores)
+        # pts = nav_goal_coords[candidate]
+        # rr.log("map/candidate", rr.Points2D(rotate_frame(pts), colors=[[255,255,0]]*pts.shape[0], radii=[1]*pts.shape[0]))
+        # print(time.time() - t1)
+        # raise ValueError
+
+    def compute_frontiers_and_POIs(self, allow_retry=True):
         """
-        Projects the dense features into the map
-        TODO We could get rid of sparse tensors entirely and instead use arrays of indices and values to reduce overhead
-        :param values: torch tensor of values, shape (hf, wf, feature_dim)
-        :param depth: torch tensor of depth values, shape (h, w)
-        :param tf_camera_to_episodic:
-        :param fx:
-        :param fy:
-        :param cx:
-        :param cy:
-        :return: (confidences_mapped, values_mapped, obstacle_mapped, obstcl_confidence_mapped), sparse COO tensor in map coordinates
-        """
-        # check if values is on cuda
-        if not values.is_cuda:
-            print("Warning: Provided value array is not on cuda, which it should be as an output of a model. Moving to "
-                  "Cuda, which will slow things down.")
-            values = values.to("cuda")
-        if not depth.is_cuda:
-            print(
-                "Warning: Provided depth array is not on cuda, which it could be if is an output of a model. Moving to "
-                "Cuda, which will slow things down.")
-            depth = depth.to("cuda")
-
-        if values.shape[0:2] == depth.shape[0:2]:
-            # our values align with the depth pixels
-            depth_aligned = depth
-        else:
-            # our values are to be considered "patch wise" where we need to project each patch, by averaging the
-            # depth values within that patch
-            if self.dense_projection == DenseProjectionType.SUBSAMPLE:
-                nh = values.shape[0]
-                nw = values.shape[1]
-                h = depth.shape[0]
-                w = depth.shape[1]
-                # TODO: this is possibly inaccurate, the patch_size might not add up and introduce errors
-                patch_size_h = ceildiv(h, nh)
-                patch_size_w = ceildiv(w, nw)
-
-                pad_h = patch_size_h * nh - h
-                pad_w = patch_size_w * nw - w
-                pad_h_before = pad_h // 2
-                pad_h_after = pad_h - pad_h_before
-                pad_w_before = pad_w // 2
-                pad_w_after = pad_w - pad_w_before
-
-                depth_padded = np.pad(depth, ((pad_h_before, pad_h_after), (pad_w_before, pad_w_after)))
-                depth_aligned = depth_padded.reshape(nh, patch_size_h, nw, patch_size_w).mean(axis=(1, 3))
-            elif self.dense_projection == DenseProjectionType.INTERPOLATE:
-                values = torch.nn.functional.interpolate(values.permute(2, 0, 1).unsqueeze(0),
-                                                         size=depth.shape,
-                                                         mode='bilinear',
-                                                         align_corners=False).squeeze(0).permute(1, 2, 0)
-                depth_aligned = depth
-            else:
-                raise Exception("Unsupported Dense Projection Mode.")
-
-        # TODO this will be wrong for sub-sampled as e.g. fx will be wrong
-        depth_image_smoothed = depth_aligned
-
-        mask = depth_image_smoothed == float('inf')
-        depth_image_smoothed[mask] = depth_image_smoothed[~mask].max()
-        kernel_size = 11
-        pad = kernel_size // 2
-
-        depth_image_smoothed = -torch.nn.functional.max_pool2d(-depth_image_smoothed.unsqueeze(0), kernel_size,
-                                                               padding=pad,
-                                                               stride=1).squeeze(0)
-        # depth_image_smoothed = F.gaussian_blur(depth_image_smoothed, [31, 31], sigma=4.0)
-        # TODO Gaussian Blur temporarily disabled
-        dx = torch.gradient(depth_image_smoothed, dim=1)[0] / (fx / depth.shape[1])
-        dy = torch.gradient(depth_image_smoothed, dim=0)[0] / (fy / depth.shape[0])
-        gradient_magnitude = torch.sqrt(dx ** 2 + dy ** 2)
-        gradient_magnitude = torch.nn.functional.max_pool2d(gradient_magnitude.unsqueeze(0), 11, stride=1,
-                                                            padding=5).squeeze(0)
-        scores = ((1 - torch.tanh(gradient_magnitude * self.gradient_factor)) *
-                  torch.exp(-((self.optimal_object_distance - depth) / self.optimal_object_factor) ** 2 / 3.0))
-        scores_aligned = scores.reshape(-1)
-
-        projected_depth, hole_mask = self.project_depth_camera(depth_aligned, (depth.shape[0], depth.shape[1]), fx,
-                                                    fy, cx, cy)
-
-        rotated_pcl = rotate_pcl(projected_depth, tf_camera_to_episodic)
-        cam_x, cam_y = tf_camera_to_episodic[:2, 3] / tf_camera_to_episodic[3, 3]
-        rotated_pcl[:, :2] += torch.tensor([cam_x, cam_y], device='cuda')
-
-        values_aligned = values.reshape((-1, values.shape[-1]))
-
-        pcl_grid_ids = torch.floor(rotated_pcl[:, :2] / self.cell_size).to(torch.int32)
-        pcl_grid_ids[:, 0] += self.map_center_cells[0]
-        pcl_grid_ids[:, 1] += self.map_center_cells[1]
-
-        # Filter valid updates
-        mask = (depth_aligned.flatten() != float('inf')) & (depth_aligned.flatten() != 0) & (pcl_grid_ids[:, 0] >= self.kernel_half + 1) & (
-                pcl_grid_ids[:, 0] < self.n_cells - self.kernel_half - 1) & (
-                       pcl_grid_ids[:, 1] >= self.kernel_half + 1) & (
-                       pcl_grid_ids[:, 1] < self.n_cells - self.kernel_half - 1)  # for value map
-        if hole_mask.nelement() == 0:
-            mask_obstacle = mask & (((rotated_pcl[:, 2]> self.obstacle_min) & (
-                                         rotated_pcl[:, 2]  < self.obstacle_max)) )
-        else:
-            mask_obstacle = mask & (((rotated_pcl[:, 2] > self.obstacle_min) & (
-                    rotated_pcl[:, 2] < self.obstacle_max)) | hole_mask)
-        mask &= (scores_aligned > 1e-5)
-        mask_obstacle_masked = mask_obstacle[mask]
-        scores_masked = scores_aligned[mask]
-
-        pcl_grid_ids_masked = pcl_grid_ids[mask].T
-        values_to_add = values_aligned[mask] * scores_masked.unsqueeze(1)
-
-        combined_data = torch.cat((
-            values_to_add,
-            mask_obstacle_masked.unsqueeze(1),
-            torch.ones((values_to_add.shape[0], 1), dtype=torch.uint8, device="cuda"),
-            scores_masked.unsqueeze(1)),
-            dim=1)  # prepare to aggregate doubles (values pointing to the same grid cell)
-
-        # define the map from unique ids to all ids
-        pcl_grid_ids_masked_unique, pcl_mapping = pcl_grid_ids_masked.unique(dim=1, return_inverse=True)
-        # coalesce the data
-        coalesced_combined_data = torch.zeros((pcl_grid_ids_masked_unique.shape[1], combined_data.shape[-1]),
-                                              dtype=torch.float32, device="cuda")
-        coalesced_combined_data.index_add_(0, pcl_mapping, combined_data)
-
-        # Extract the data
-        data_dim = combined_data.shape[-1]
-        obstacle_mapped = coalesced_combined_data[:, data_dim - 3]
-        scores_mapped = coalesced_combined_data[:, data_dim - 1].unsqueeze(1)
-        sums_per_cell = coalesced_combined_data[:, data_dim - 2].unsqueeze(1)
-        new_map = coalesced_combined_data[:, :data_dim - 3]
-
-        # Normalize (from sum to mean)
-        new_map /= scores_mapped
-        scores_mapped /= sums_per_cell
-        obstcl_confidence_mapped = scores_mapped
-
-
-        # Get all the ids that are affected by the kernel (depth noise blurring)
-        ids = pcl_grid_ids_masked_unique
-        all_ids_ = torch.zeros((2, ids.shape[1], self.kernel_size, self.kernel_size), device="cuda")
-        all_ids_[0] = (ids[0].unsqueeze(-1).unsqueeze(-1) + self.kernel_ids_x)
-        all_ids_[1] = (ids[1].unsqueeze(-1).unsqueeze(-1) + self.kernel_ids_y)
-        all_ids, mapping = all_ids_.reshape(2, -1).unique(dim=1, return_inverse=True)
-
-        # Compute the corresponding depths
-        depths = ((all_ids - self.map_center_cells.unsqueeze(1)) * self.cell_size - torch.tensor([cam_x, cam_y],
-                                                                                 dtype=torch.float32, device="cuda")
-                  .unsqueeze(1))
-
-        # And the depth noise
-        depth_noise = torch.sqrt(torch.sum(depths ** 2, dim=0)) * self.depth_factor / self.cell_size
-
-
-        # Compute the sum for each kernel centered around a grid cell
-        kernel_sums = gaussian_kernel_sum(self.kernel_components_sum, depth_noise).unsqueeze(-1)  # all unique ids
-
-        # remap the depths to all the id's to kernels centered around the original points in ids and
-        # compute the sparse inverse kernel elements
-        kernels = compute_gaussian_kernel_components(self.kernel_components, depth_noise[mapping].reshape(-1,
-                                                                                  self.kernel_size, self.kernel_size))
-
-        coalesced_map_data = torch.zeros((all_ids.shape[1], self.feature_dim), dtype=torch.float32, device="cuda")
-        coalesced_scores = torch.zeros((all_ids.shape[1], 1), dtype=torch.float32, device="cuda")
-        # Compute the blurred map and blurred scores
-        coalesced_map_data.index_add_(0, mapping, (kernels.unsqueeze(-1) *
-                                                   new_map.unsqueeze(1).unsqueeze(1)).reshape(-1, self.feature_dim))
-        coalesced_scores.index_add_(0, mapping, (kernels * scores_mapped.unsqueeze(1)).reshape(-1, 1))
-
-        # Free up memory to avoid OOM
-        torch.cuda.empty_cache()
-
-        # Normalize the map and scores
-        coalesced_map_data /= kernel_sums
-        coalesced_scores /= kernel_sums
-
-        # Compute the obstacle map
-        obstacle_mapped[:] = (obstacle_mapped > 0).to(torch.float32)
-
-        obstacle_mapped = torch.sparse_coo_tensor(pcl_grid_ids_masked_unique, obstacle_mapped.unsqueeze(1), (self.n_cells, self.n_cells, 1), is_coalesced=True).cpu()
-        obstcl_confidence_mapped = torch.sparse_coo_tensor(pcl_grid_ids_masked_unique, obstcl_confidence_mapped, (self.n_cells, self.n_cells, 1), is_coalesced=True).cpu()
-        # print("Updating with sparse matrix of size {}x{} with {} non-zero elements, resulting size is {} Mb".format(
-        #     self.n_cells, self.n_cells, new_map.values().shape[0] * self.feature_dim,
-        #                                 new_map.element_size() * new_map.values().shape[
-        #                                     0] * self.feature_dim / 1024 / 1024))
-        return torch.sparse_coo_tensor(all_ids, coalesced_scores, (self.n_cells, self.n_cells, 1), is_coalesced=True).cpu(), torch.sparse_coo_tensor(all_ids, coalesced_map_data, (self.n_cells, self.n_cells, self.feature_dim), is_coalesced=True).cpu(), obstacle_mapped.cpu(), obstcl_confidence_mapped.cpu()
-
-    def project_single(self,
-                       values: torch.Tensor,
-                       depth: np.ndarray,
-                       tf_camera_to_episodic,
-                       fx, fy, cx, cy
-                       ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Projects a single value observation into the map using a heuristic, similar to VLFM
-        :param values:
-        :param depth:
-        :param tf_camera_to_episodic:
-        :param fx:
-        :param fy:
-        :param cx:
-        :param cy:
+        Computes the frontiers (at the border from fully explored to confidence > 0),
+        and points of interest (high similarity regions within the fully explored, but not checked map)
         :return:
         """
-        projected_depth = self.project_depth_camera(depth, *(depth.shape[0:2]), fx, fy, cx, cy)
-        # TODO needs to be implemented
-        raise NotImplementedError
+        nav_goals: List[NavGoal] = []
 
-    def project_depth_camera(self,
-                             depth: torch.Tensor,
-                             camera_resolution: Tuple[int, int],
-                             fx, fy, cx, cy
-                             ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Projects the depth into 3D pointcloud. Camera resolution is passed if the depth is subsampled,
-        to match value array resolution.
-        :param depth: torch Tensor of shape (h, w), not necessarily the same as camera resolution
-        :param camera_resolution: tuple of original camera resolution to correct depth if necessary (w, h)
-        :param fx:
-        :param fy:
-        :param cx:
-        :param cy:
-        :return: a point cloud of shape (h * w, 3), where x is depth (points into the image),
-                                                          y is horizontal (points left),
-                                                          z is vertical (points up)
-        """
-        # TODO are the "-1" necessary?
-        x = torch.arange(0, depth.shape[1], device="cuda") * (camera_resolution[1] - 1) / (depth.shape[1] - 1)
-        y = torch.arange(0, depth.shape[0], device="cuda") * (camera_resolution[0] - 1) / (depth.shape[0] - 1)
-        xx, yy = torch.meshgrid(x, y, indexing="xy")
-        xx = xx.flatten()
-        yy = yy.flatten()
-        zz = depth.flatten()
-        x_world = (xx - cx) * zz / fx
-        y_world = (yy - cy) * zz / fy
-        z_world = zz
-        point_cloud = torch.vstack((z_world, -x_world, -y_world)).T
-        if self.filter_stairs:
-            hole_mask = -y_world < self.floor_threshold # todo threshold parameter
-            if hole_mask.any():
-                scale_factor = self.floor_level / -y_world[hole_mask]
-                point_cloud[hole_mask] *= scale_factor.unsqueeze(-1)
-                return point_cloud, hole_mask
+        if self.similarity_map is None:
+            return
+        
+        # Compute the frontiers
+        frontiers, unexplored_map, largest_contour = detect_frontiers(
+            self.navigable_map.astype(np.uint8),
+            self.fully_explored_map.astype(np.uint8),
+            self.confidence_map > 0,
+            int(1.0 * ((self.config.n_points / self.config.size) ** 2))
+        )
 
-        return point_cloud, torch.empty((0,))
+        # moreover we compute points of interest. These are high similarity regions within the fully explored,
+        # but not checked map
+        # For that we make use of the cluster_high_similarity_regions function, and project the points to the
+        # navigable map
+        adjusted_score = self.similarity_map + 1.0  # only positive scores
+        map_def = self.similarity_map
+        normalized_map = (map_def - map_def.min()) / (map_def.max() - map_def.min() + 1e-7)
+        # TODO This will give us wrong cluster scores, we will need to adjust this to match the frontier scores!
+        clusters = cluster_high_similarity_regions(normalized_map, (self.confidence_map > 0.0).cpu().numpy())
+        for cluster in clusters:
+            cluster.compute_score(adjusted_score)
+            if len(self.blacklisted_nav_goals) == 0 or not np.any(
+                    np.all(cluster.get_descr_point() == self.blacklisted_nav_goals, axis=1)):
+                if ((largest_contour is None or cv2.pointPolygonTest(largest_contour, cluster.center.astype(float),
+                                                                        measureDist=True) > -15.0) or
+                    self.fully_explored_map[cluster.center[0], cluster.center[1]]) and \
+                        (not self.checked_map[cluster.center[0], cluster.center[1]]):
+                    nav_goals.append(cluster)
+        
+        if self.config.log_rerun:
+            log_map_rerun(self.confidence_map.cpu().numpy(), path="map/confidence")
+            log_map_rerun(unexplored_map, path="map/unexplored")
 
-    def metric_to_px(self, x, y):
-        epsilon = 1e-9  # Small value to account for floating-point imprecision
+        frontiers = [f[..., ::-1].squeeze() for f in frontiers]  # need to flip coords for some reason
+        adjusted_score_frontier = adjusted_score.copy()
 
-        return (
-            int(x / self.cell_size + self.map_center_cells[0].item() + epsilon),
-            int(y / self.cell_size + self.map_center_cells[1].item() + epsilon))
+        # set the score of the fully explored map to 0 for the frontiers
 
-    def px_to_metric(self, px, py):
-        return ((px - self.map_center_cells[0].item()) * self.cell_size,
-                (py - self.map_center_cells[1].item()) * self.cell_size)
+        for frontier_points in frontiers:
+            frontier_mp = get_frontier_midpoint(frontier_points).astype(np.uint32)
+            score, *_ = Planning.compute_reachable_area_score(
+                frontier_mp,
+                (self.confidence_map > 0).cpu().numpy(),
+                adjusted_score_frontier,
+                self.frontier_depth)
+            frontier_mp = np.round(frontier_mp)
+            if len(self.blacklisted_nav_goals) == 0 or not np.any(np.all(frontier_mp == self.blacklisted_nav_goals, axis=1)):
+                frontier = Frontier(frontier_midpoint=frontier_mp, points=frontier_points, frontier_score=score, frontier_explore_score=0)
+                nav_goals.append(frontier)
 
+        if self.config.log_rerun:
+            if len(nav_goals) > 0:
+                pts = np.array([nav_goal.get_descr_point() for nav_goal in nav_goals])
+                scores = np.array([nav_goal.get_score() for nav_goal in nav_goals])
+                rr.log("map/frontiers_and_POIs",
+                        rr.Points2D(rotate_frame(pts), colors=np.flip(monochannel_to_inferno_rgb(scores), axis=-1),
+                                    radii=[1] * pts.shape[0]))               
+
+        self.set_frontiers_exploration_score([frontier for frontier in nav_goals if type(frontier)==Frontier])
+
+        if len(nav_goals) == 0:
+            if not self.initializing and allow_retry:
+                self.reset_checked_map()
+                return self.compute_frontiers_and_POIs(allow_retry=False)
+            return []
+
+        self.initializing = False
+        return nav_goals
+
+    def split_frontiers_and_POIs(self, obj_detected: np.ndarray, nav_goals: List[NavGoal])->Dict[int, List[NavGoal]]:
+        agent_coords = self.agents_poses[..., :-1]
+        objective_coords = np.array([nav_goal.get_descr_point() for nav_goal in nav_goals])
+
+        n_agents = agent_coords.shape[0]
+        n_obj = objective_coords.shape[0]
+        if n_obj == 0:
+            return {a_id:[] for a_id in range(n_agents)}
+
+        # --- Step 0: filter active agents ---
+        active_mask = ~obj_detected
+        active_agent_ids = np.where(active_mask)[0]
+
+        n_active = len(active_agent_ids)
+        if n_active == 0:
+            return {}
+
+        active_coords = agent_coords[active_mask]
+
+        # --- Step 1: compute distance matrix (only active agents) ---
+        dists = np.linalg.norm(
+            active_coords[:, None, :] - objective_coords[None, :, :],
+            axis=2
+        )
+        
+        # --- Step 2: balanced assignment ---
+        k = n_obj // n_active
+
+        base_obj_count = k * n_active
+        base_indices = np.arange(n_obj)[:base_obj_count]
+
+        expanded_dists = np.repeat(dists[:, base_indices], k, axis=0)
+
+        row_ind, col_ind = scipy.optimize.linear_sum_assignment(expanded_dists)
+
+        # --- Step 3: build full assignment dict (ALL agents) ---
+        assignments = {i: [] for i in range(n_agents)}
+        assigned_mask = np.zeros(n_obj, dtype=bool)
+
+        for r_idx, c_idx in zip(row_ind, col_ind):
+            local_agent = r_idx // k              # index in active agents
+            agent_id = active_agent_ids[local_agent]  # map back to original ID
+
+            obj_id = base_indices[c_idx]
+
+            assignments[agent_id].append(nav_goals[obj_id])
+            assigned_mask[obj_id] = True
+
+        # --- Step 4: assign remaining objectives ---
+        remaining_objs = np.where(~assigned_mask)[0]
+
+        for obj_id in remaining_objs:
+            # only consider active agents
+            closest_local = np.argmin(dists[:, obj_id])
+            agent_id = active_agent_ids[closest_local]
+
+            assignments[agent_id].append(nav_goals[obj_id])
+
+        assignments = {k: sorted(v, key=lambda x: x.get_score(), reverse=True) for k, v in assignments.items()}
+
+        return assignments
 
 if __name__ == "__main__":
-    rr.init("rerun_example_points3d", spawn=False)
-    rr.connect("127.0.0.1:1234")
-    rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)  # Set an up-axis
-    rr.log(
-        "world/xyz",
-        rr.Arrows3D(
-            vectors=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-            colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
-        ),
-    )
-    from detectron2.data.detection_utils import read_image
-
-    map = OneMap(1)
-    depth = read_image('test_images/depth2.png', format="BGR") * (-1) + 255
-    depth2 = read_image('test_images/depth.png', format="BGR")
-
-    fac = 10
-    x = torch.arange(0, depth.shape[1] / fac, dtype=torch.float32)
-    y = torch.arange(0, depth.shape[0], dtype=torch.float32)
-    xx, yy, = torch.meshgrid(x, y)
-
-    values = torch.sin(xx / (50.0 / fac)).T.unsqueeze(0)
-
-    # values[:, :depth.shape[1]//2] = 1.0
-    start = time.time()
-    # map.update(torch.zeros((depth.shape[0], depth.shape[1], 3)), depth, np.eye(4))
-    map.update(values, depth[:, :, 0], np.eye(4))
-    map.update(-values, depth2[:, :, 0], np.eye(4))
-    print(time.time() - start)
+    pass

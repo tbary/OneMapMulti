@@ -41,17 +41,20 @@ def compute_reachable_area_score(start: np.ndarray,
     return compute_reachable_area(start, mask_coverage, scores, max_depth)
 
 
-def compute_to_goal(start: np.ndarray, mask_coverage: np.ndarray, feasible_goal_pts: np.ndarray, goal_pt: np.ndarray,
-                    obstcl_kernel_size, min_goal_dist):
-    best_path = a_star_range(mask_coverage, feasible_goal_pts, tuple(start), (goal_pt[0], goal_pt[1]),
-                             obstcl_kernel_size, min_goal_dist)
+def compute_to_goal(
+        start: np.ndarray, 
+        mask_coverage: np.ndarray, 
+        feasible_goal_pts: np.ndarray, 
+        goal_pt: np.ndarray, 
+        obstcl_kernel_size:int, 
+        min_goal_dist:int
+    ):
+    best_path = a_star_range(mask_coverage, feasible_goal_pts, tuple(start), tuple(goal_pt), obstcl_kernel_size, min_goal_dist)
     if best_path is None or len(best_path) == 0:
-        best_path = a_star_range(mask_coverage, feasible_goal_pts, tuple(start), (goal_pt[0], goal_pt[1]),
-                                 obstcl_kernel_size, min_goal_dist * 2)
+        best_path = a_star_range(mask_coverage, feasible_goal_pts, tuple(start), tuple(goal_pt), obstcl_kernel_size, min_goal_dist * 2)
+    
     if best_path and len(best_path):
-        for i in range(len(best_path)):
-            best_path[i] = np.array(best_path[i])
-        return best_path
+        return [np.array(step) for step in best_path]
     return None
 
 
@@ -132,7 +135,7 @@ if __name__ == "__main__":
     scores_a, num, reachable = compute_reachable_area_score(start, mask_coverage, scores, 40000)
     print(time.time() - a)
     a = time.time()
-    scores_b, num, reachable = compute_reachable_area_score_optimized(start, mask_coverage, scores, 40000)
+    scores_b, num, reachable = compute_reachable_area_score_optimized(start, mask_coverage, scores, 40000) # type: ignore
     print(time.time() - a)
     a = time.time()
     scores_c, num, reachable = compute_reachable_area_score(start, mask_coverage, scores, 40000)
@@ -156,7 +159,7 @@ if __name__ == "__main__":
     # Plot path
     ax[1].imshow(mask_coverage, cmap='gray')
     ax[1].set_title('Path')
-    path = np.array(path)
+    path = np.array(path) # type: ignore
     ax[1].plot(path[:, 1], path[:, 0], label='Path')
     ax[1].scatter(start[1], start[0], color='blue', label='Start')
     # ax[2].legend()

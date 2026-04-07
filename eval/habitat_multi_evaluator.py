@@ -1,23 +1,16 @@
 # eval utils
-from eval import get_closest_dist, FMMPlanner
+from eval import get_closest_dist
 from eval.actor import MONActor
-from eval.dataset_utils.gibson_dataset import load_gibson_episodes
-from mapping import rerun_logger
+from mapping import rerun_logger, rotate_frame
 from config import EvalConf
 from onemap_utils import monochannel_to_inferno_rgb
 from eval.dataset_utils import *
-from habitat.utils.visualizations import maps
+
 import matplotlib.pyplot as plt
 import tqdm
-import seaborn as sns
 
 # os / filsystem
-import bz2
 import os
-from os import listdir
-import gzip
-import json
-import pathlib
 
 # cv2
 import cv2
@@ -25,35 +18,16 @@ import cv2
 # numpy
 import numpy as np
 
-# skimage
-import skimage
-
-# dataclasses
-from dataclasses import dataclass
-
-# quaternion
-import quaternion
-
 # typing
-from typing import Tuple, List, Dict
-import enum
+from typing import Dict
 
 # habitat
 import habitat_sim
 from habitat_sim import ActionSpec, ActuationSpec
 from habitat_sim.utils import common as utils
 
-# tabulate
-from tabulate import tabulate
-
 # rerun
 import rerun as rr
-
-# pandas
-import pandas as pd
-
-# pickle
-import pickle
 
 # scipy
 from scipy.spatial.transform import Rotation as R
@@ -75,47 +49,32 @@ def _get_pose(state):
     pose[3] = yaw
     return pose
 
-def _normalize(x):
+def _normalize(x:np.ndarray):
     return (x-x.min())/(x.max()-x.min())
 
 def _is_stuck(poses, agents_ids, threshold = 0.05):
     return np.max([np.linalg.norm(poses[agent_id][-1][:2] - poses[agent_id][-10][:2]) for agent_id in agents_ids]) < threshold
 
-def rotate_frame(points):
-    return [[y, x] for (x, y) in points]
-
-SEQ_LEN = 3
-class Result(enum.Enum):
-    SUCCESS = 1
-    FAILURE_MISDETECT = 2
-    FAILURE_STUCK = 3
-    FAILURE_OOT = 4
-    FAILURE_NOT_REACHED = 5
-    FAILURE_ALL_EXPLORED = 6
-
-
 class Metrics:
     def __init__(self, ep_id) -> None:
         self.ep_id = ep_id
-        # self.sequence_lengths:list[float] = []
         self.sequence_results:list[Result] = []
+        self.sequence_agent_finding:list[int] = []
         self.sequence_poses:list[list[np.ndarray]] = []
         self.sequence_object:list[str] = []
 
-    def add_sequence(self, sequences: list, result: Result, target_object: str) -> None:
+    def add_sequence(self, sequences: list, result: Result, agent_id:int, target_object: str) -> None:
         start_id = 0
         if len(self.sequence_poses) > 0:
-            start_id = sum([len(seq) for seq in self.sequence_poses])
+            start_id = sum([len(seq[0]) for seq in self.sequence_poses])
         seq_poses = [np.array(seq)[start_id:, :] for seq in sequences]
         self.sequence_poses.append(seq_poses)
         self.sequence_results.append(result)
-        # Careful when uncommenting, faulty but unnused component...
-        # self.sequence_lengths.append(np.linalg.norm(seq_poses[1:, :2] - seq_poses[:-1, :2]))
+        self.sequence_agent_finding.append(agent_id)
         self.sequence_object.append(target_object)
 
     def get_progress(self):
         return self.sequence_results.count(Result.SUCCESS) /SEQ_LEN
-
 
 class HabitatMultiEvaluator:
     def __init__(self,
@@ -124,8 +83,6 @@ class HabitatMultiEvaluator:
                  ) -> None:
         self.config = config
         self.multi_object = config.multi_object
-        self.max_steps = config.max_steps
-        self.max_dist = config.max_dist
         self.controller = config.controller
         self.mapping = config.mapping
         self.planner = config.planner
@@ -148,7 +105,6 @@ class HabitatMultiEvaluator:
         self.max_vel = config.controller.max_vel
         self.max_ang_vel = config.controller.max_ang_vel
         self.time_step = 1.0 / self.control_frequency
-        self.num_seq = SEQ_LEN
         self.square = config.square_im
 
         if self.multi_object:
@@ -159,7 +115,7 @@ class HabitatMultiEvaluator:
             raise RuntimeError("You are running the multi object evaluation with a single object config.")
         if self.actor is not None:
             self.logger = rerun_logger.RerunLogger(self.actor.one_map, False, "",  self.n_agents) if self.log_rerun else None
-        self.results_path = "/home/finn/active/MON/results_gibson_multi" if self.is_gibson else "results_multi/"
+        self.results_path = "/home/finn/active/MON/results_gibson_multi" if self.is_gibson else self.config.results_path
 
     def load_scene(self, scene_id: str):
         if self.sim is not None:
@@ -204,13 +160,15 @@ class HabitatMultiEvaluator:
         if 'discrete' in action.keys():
             # We have a discrete actor
             self.sim.step(action['discrete'])
+            if self.log_rerun:
+                rr.log("actions_updates",rr.TextLog(f"Discrete actions: {action['discrete']}."))
 
-        elif 'continuous' in action.keys():
-            agents_ids = list(range(self.n_agents))
+        if 'continuous' in action.keys():
+            agents_ids = list(action['continuous'].keys())
             for agent_id in agents_ids:
                 # We have a continuous actor
-                self.vel_control.angular_velocity = action['continuous']['angular'][agent_id]
-                self.vel_control.linear_velocity = action['continuous']['linear'][agent_id]
+                self.vel_control.angular_velocity = action['continuous'][agent_id]['angular']
+                self.vel_control.linear_velocity = action['continuous'][agent_id]['linear']
                 agent_state = self.sim.get_agent(agent_id).state
                 previous_rigid_state = habitat_sim.RigidState(
                     utils.quat_to_magnum(agent_state.rotation), agent_state.position
@@ -233,284 +191,14 @@ class HabitatMultiEvaluator:
                     target_rigid_state.rotation
                 )
                 self.sim.get_agent(agent_id).set_state(agent_state)
+
+                if self.log_rerun:
+                    rr.log("actions_updates",rr.TextLog(f"Agent {agent_id} action command: {self.vel_control.angular_velocity} (angular), {self.vel_control.linear_velocity} (linear)."))
             self.sim.step_physics(self.time_step)
 
-    def display_results(self, data, sort_by):
-        def printkey():
-            print("\nReading key:")
-            print("\tSUCCESS: Object was reached by one of the agents.")
-            print(f"\tFAILURE_OOT: Agents ran out of iterations ({self.max_steps}) before finding the object.")
-            print("\tFAILURE_MISDETECT: An agent misdetected the target object.")
-            print("\tFAILURE_ALL_EXPLORED: Agents explored the whole scene and couldn't find object (object exists in scene).")
-            print("\tFAILURE_NOT_REACHED: An agent detected the object, but could not get to it.")
-            print("\tFAILURE_STUCK: All agents soft locked themselves.")
-            print("\tProgress: Average proportion of objects found in the episode.")
-            print("\tSPL: Success weighted by path length. Penalize successes with deviation from optimal path a priori.")
-            print("\topt_PL: Average optimal path length to reach target.")
-            print("\ts: All the objects of the scene where found.")
-            print("\ts_spl: All object in scene found penalized with deviation from optimal path a priori.")
-            print("\n")
-
-        def calc_prog_per_episode(group):
-            successes = (group.groupby('experiment')['state'].apply(lambda x: (x == 1).sum()))
-            progress = successes / self.num_seq
-            return progress
-
-        def calc_spl_per_episode(group):
-            spls_per_exp = group.groupby('experiment')['spl'].sum()
-            return spls_per_exp
-
-        def calculate_percentages(group):
-            total = len(group)
-            result = pd.Series({Result(state).name: (group['state'] == state).sum() / total for state in data["state"].unique()})
-            progress = calc_prog_per_episode(group)
-            spl = calc_spl_per_episode(group)
-            s = progress[progress == 1]
-            result['Progress'] = progress.mean()
-            result['SPL'] = spl.mean()
-            result['opt_PL'] = group['opt_path'].mean()
-            result['Map Size'] = group['map_size'].mean() / 100
-            result['s'] = s.sum() / len(progress)
-            result['s_spl'] = spl[progress == 1].sum()/len(progress)
-
-            # Calculate average SPL and multiply by 100
-            # avg_spl = group['spl'].mean()
-            # result['Average SPL'] = avg_spl
-
-            return result
-
-        def format_percentages(val):
-            return f"{val:.2%}" if isinstance(val, float) else val
-
-        def has_success(group, seq_id):
-            return group[(group['sequence'] == seq_id) & (group['state'] == 1)].shape[0] > 0
-        
-        # Per-object results
-        object_results = data.groupby('object').apply(calculate_percentages, include_groups=False).reset_index()
-        object_results = object_results.rename(columns={'object': 'Object'})
-
-        # Per-scene results
-        scene_results = data.groupby('scene').apply(calculate_percentages, include_groups=False).reset_index()
-        scene_results = scene_results.rename(columns={'scene': 'Scene'})
-
-        # Overall results
-        overall_percentages = calculate_percentages(data)
-        overall_row = pd.DataFrame([{'Object': 'Overall'} | overall_percentages.to_dict()])
-        object_results = pd.concat([overall_row, object_results], ignore_index=True)
-
-        overall_row = pd.DataFrame([{'Scene': 'Overall'} | overall_percentages.to_dict()])
-        scene_results = pd.concat([overall_row, scene_results], ignore_index=True)
-
-        # Sorting
-        object_results = object_results.sort_values(by=sort_by, ascending=False)
-        scene_results = scene_results.sort_values(by=sort_by, ascending=False)
-
-        # Apply formatting to all columns except the first one (Object/Scene)
-        object_table = object_results.iloc[:, 0].to_frame().join(
-            object_results.iloc[:, 1:].map(format_percentages))
-        scene_table = scene_results.iloc[:, 0].to_frame().join(
-            scene_results.iloc[:, 1:].map(format_percentages))
-
-        printkey()
-
-        print(f"Results by Object (sorted by {sort_by} rate, descending):")
-        print(tabulate(object_table, headers='keys', tablefmt='pretty', floatfmt='.2%'))
-
-        print(f"\nResults by Scene (sorted by {sort_by} rate, descending):")
-        print(tabulate(scene_table, headers='keys', tablefmt='pretty', floatfmt='.2%'))
-        _, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        data_per_scene = data.groupby('scene')
-        sr_per_scene = []
-        spl_per_scene = []
-        for scene, scene_data in data_per_scene:
-            print(f"\nScene: {scene}")
-            success_rates = []
-            spl_values = []
-            seq_numbers = []
-            for i in range(self.num_seq):
-                sequences = scene_data[scene_data['sequence'] == i]
-                if len(sequences) > 0:
-                    successful_experiments = sequences[sequences['state'] == 1]
-                    spl = sequences['spl'].mean() * SEQ_LEN
-                    success_rate = len(successful_experiments) / len(sequences)
-
-                    success_rates.append(success_rate)
-                    spl_values.append(spl)
-                    seq_numbers.append(i)
-                    print(f"  Sequence {i}:")
-                    print(f"    Num of experiments: {len(sequences)}")
-                    print(f"    Overall SPL: {spl:.4f}")
-                    print(f"    Fraction of successful experiments: {success_rate:.2%}")
-                else:
-                    print(f"  Sequence {i}: No data")
-                    success_rates.append(0)
-                    spl_values.append(0)
-            sr_per_scene.append(success_rates)
-            spl_per_scene.append(spl_values)
-        print(f"SPL per scene: {np.mean(np.array(spl_per_scene), axis=0)}, Success Rate per scene: {np.mean(np.array(sr_per_scene), axis=0)}")
-
-        sr_df = pd.DataFrame(sr_per_scene).T.stack().reset_index()
-        sr_df.columns = ["sequence","experiment","success_rate"]
-
-        sns.lineplot(data=sr_df, x="sequence", y="success_rate",
-                    estimator="mean", errorbar=("ci",95), marker="o", ax=ax1)
-
-        spl_df = pd.DataFrame(spl_per_scene).T.stack().reset_index()
-        spl_df.columns = ["sequence","experiment","spl"]
-
-        sns.lineplot(data=spl_df, x="sequence", y="spl",
-                    estimator="mean", errorbar=("ci",95), marker="o", ax=ax2)
-
-        # Set up Success Rate subplot
-        ax1.set_xlabel('Sequence Number')
-        ax1.set_ylabel('Success Rate')
-        ax1.set_title('Success Rate per Sequence')
-        # ax1.legend()
-        ax1.grid(True)
-
-        # Set up SPL subplot
-        ax2.set_xlabel('Sequence Number')
-        ax2.set_ylabel('SPL')
-        ax2.set_title('SPL per Sequence')
-        # ax2.legend()
-        ax2.grid(True)
-
-        plt.tight_layout()
-        plt.savefig('output_plot.png')
-
-        # selected_experiment_ids = successful_experiments['experiment'].unique()
-        # experiments_with_second_success = successful_experiments.groupby('experiment').filter(
-        #     lambda x: has_success(x, 1))
-        # successful_second_ids = experiments_with_second_success['experiment'].unique()
-        # fraction_successful = len(successful_second_ids) / len(selected_experiment_ids) if len(
-        #     selected_experiment_ids) > 0 else 0
-        #
-        # # Calculate conditional SPL for each experiment
-        # second_sequences = data[(data['state'] == 1) & (data['sequence'] == 1)]
-        # conditional_spl = second_sequences['spl'].mean()
-        # print(f"\nOverall Conditional SPL (second sequence, given first success): {conditional_spl:.4f}")
-        #
-        # print(f"Fraction of successful first experiments: {len(selected_experiment_ids)/len(all_ids):.2%}")
-        # print(f"Fraction of successful second, conditioned on first: {fraction_successful:.2%}")
-
-    def read_results(self, path, sort_by, data_pkl=None):
-        # !!! SPL is not properly defined for multi agents... Find another metric
-        def compute_spl(sim, poses, scenes, experiment_num, seq_num):
-            spl_agents = []
-            for pose in poses:
-                path_length = np.linalg.norm(pose[1:, :3] - pose[:-1, :3], axis=1).sum()
-                start_pos = pose[0, :3]
-                pos = np.array([-start_pos[1], start_pos[2], -start_pos[0]])
-                
-                floor_data = scenes[self.episodes[experiment_num].scene_id].floors[self.episodes[experiment_num].floor_id]
-                possible_objs = floor_data.objects[self.episodes[experiment_num].obj_sequence[seq_num]]
-                
-                best_dist = np.inf
-                obj_found = False
-                for obj in possible_objs:
-                    dist, _ = object_nav_gen.get_geodesic(pos, sim, obj, correct_start=True)
-                    if dist is not None:
-                        obj_found = True
-                        if dist < best_dist:
-                            best_dist = dist
-
-                if not obj_found:
-                    pbar.write(f"Warning: No object found for sequence {seq_num} in experiment {experiment_num}")
-                spl_agents.append(min(1.0, best_dist/ max(path_length, best_dist)))
-            return np.max(spl_agents)
-
-        if data_pkl is not None:
-            with open(data_pkl, 'rb') as f:
-                data = pickle.load(f)
-            self.display_results(data, sort_by)
-            return data
-
-        from eval.dataset_utils import gen_multiobject_dataset
-        from eval.dataset_utils.object_nav_utils import object_nav_gen
-              
-        state_dir = os.path.join(path, 'state')
-        pose_dir = os.path.join(path, "trajectories")
-
-        # Iterate through all files in the state directory
-        data = []
-        episodes, scene_data = HM3DDataset.load_hm3d_episodes(episodes:=[], scene_data:={}, gen_multiobject_dataset.path_to_hm3d_objectnav_v2)
-        gen_multiobject_dataset.load_scenes(episodes, scene_data, {}, {}, scenes:={})
-        loaded_scenes = set()
-        sim = None
-        for filename in (pbar:=tqdm.tqdm(sorted(os.listdir(state_dir)))):
-            if filename.startswith('state_') and filename.endswith('.txt'):
-                try:
-                    # Extract the experiment number from the filename
-                    experiment_num = int(filename[6:-4])  # removes 'state_' and '.txt'
-
-                    # Read the content of the file
-                    with open(os.path.join(state_dir, filename), 'r') as file:
-                        content = file.read().strip()
-
-                    state_values = [int(val) for val in content.split(',')]
-
-                    for seq_num, value in enumerate(state_values):
-                        if value == 1:
-                            poses = [np.genfromtxt(os.path.join(pose_dir, f"poses_{experiment_num}_{seq_num}_{agent_id}.csv"), delimiter=",") for agent_id in range(self.n_agents)]
-                            if len(poses[0].shape) == 1:
-                                poses = [pose.reshape((1, 4)) for pose in poses]
-
-                            if sim is None or not sim.curr_scene_name in self.episodes[experiment_num].scene_id:
-                                if sim is not None:
-                                    sim.close()
-                                sim = gen_multiobject_dataset.build_sim(gen_multiobject_dataset.path_to_hm3d_v0_2, self.episodes[experiment_num].scene_id, gen_multiobject_dataset.start_poses_tilt_angle, True)
-
-                            if self.episodes[experiment_num].scene_id not in loaded_scenes:
-                                needs_save = gen_multiobject_dataset.load_all_scene_data(
-                                    self.episodes[experiment_num].scene_id,
-                                    scenes, scene_data,
-                                    viewpoint_conf=object_nav_gen.VPConf(1.0, 0.1, 0.05), 
-                                    sim=sim
-                                )
-                                if needs_save:
-                                    pbar.write(f"Storing viewpoints for scene {self.episodes[experiment_num].scene_id}...")
-                                    gen_multiobject_dataset.store_viewpoints(scenes, self.episodes[experiment_num].scene_id,"datasets/multi_object_data")
-                                loaded_scenes.add(self.episodes[experiment_num].scene_id)
-                            
-                            spl = compute_spl(sim, poses, scenes, experiment_num, seq_num)
-
-                            top_down_map = maps.get_topdown_map(
-                                            sim.pathfinder,
-                                            height=poses[0][0,1], #assumes same height for all agents
-                                            map_resolution=512,
-                                            draw_border=True,
-                                        )
-                            map_size = top_down_map.shape[0] * top_down_map.shape[1]
-
-                        else:
-                            spl = 0
-                            map_size = 0
-
-                        data.append({
-                            'experiment': experiment_num,
-                            'sequence': seq_num,
-                            'state': value,
-                            'spl': spl / self.num_seq,
-                            'map_size': map_size,
-                            'opt_path': sum([d[0] for d in self.episodes[experiment_num].best_dist]),
-                            'object': self.episodes[experiment_num].obj_sequence[seq_num],
-                            'scene': self.episodes[experiment_num].scene_id[15:-10]
-                        })
-
-                    if self.episodes[experiment_num].episode_id != experiment_num:
-                        pbar.write(f"Warning, experiment_num {experiment_num} does not correctly resolve to episode_id {self.episodes[experiment_num].episode_id}")
-                except ValueError:
-                    pbar.write(f"Warning: Skipping {filename} due to invalid format")
-        pbar.close()
-
-        data = pd.DataFrame(data)
-        self.display_results(data, sort_by)
-
-        return data
-
     def save_final_sims(self, episode_id, sequence_id, poses):
-        final_sim = (self.actor.one_map.get_similarity_map() + 1.0) / 2.0
-        final_sim = monochannel_to_inferno_rgb(final_sim[0])
+        final_sim = (self.actor.one_map.similarity_map + 1.0) / 2.0
+        final_sim = monochannel_to_inferno_rgb(final_sim)
 
         confs = (self.actor.one_map.confidence_map > 0).cpu().squeeze().numpy()
         
@@ -556,12 +244,12 @@ class HabitatMultiEvaluator:
             plt.close(fig)
 
     def _metric_to_px(self, x, y):
-        return self.actor.one_map.metric_to_px(x,y)
+        return self.actor.projection.metric_to_px(x,y)
 
     def _px_to_metric(self, px, py):
-        return self.actor.one_map.px_to_metric(px,py)
+        return self.actor.projection.px_to_metric(px,py)
 
-    def _log_ground_truth(self, episode, current_obj):
+    def _log_ground_truth(self, episode:Episode, current_obj):
         pts = []
         for obj in self.scene_data[episode.scene_id].object_locations[current_obj]:
             if not self.is_gibson:
@@ -573,13 +261,16 @@ class HabitatMultiEvaluator:
                     pt = (pt_[0], pt_[1])
                     pts.append(self._metric_to_px(*pt))
         pts = np.array(pts)
-        rr.log("map/ground_truth", rr.Points2D(rotate_frame(pts), colors=[[255, 255, 0]], radii=[1]))
+        if self.log_rerun:
+            rr.log("map/ground_truth", rr.Points2D(rotate_frame(pts), colors=[[255, 255, 255]], radii=[1]))
 
-    def evaluate(self):
+    def evaluate(self, from_scratch=True):
         results:list[Metrics] = []
         agents_ids = list(range(self.n_agents))
 
-        for n_ep, episode in enumerate(self.episodes):
+        starting_point = 214 if from_scratch else len(os.listdir(os.path.join(self.results_path, "state")))
+
+        for n_ep, episode in enumerate(self.episodes[starting_point:]):
             poses = [[] for _ in agents_ids]
             results.append(Metrics(episode.episode_id))
 
@@ -602,23 +293,21 @@ class HabitatMultiEvaluator:
                     self._log_ground_truth(episode, current_obj)
 
                 steps = 0
-                called_found = False
-                while steps < self.max_steps and not called_found:
+                agent_called_found = -1
+                while steps < self.config.max_steps and agent_called_found == -1:
                     observations = self.sim.get_sensor_observations(agent_ids=agents_ids)
                     for agent_id in agents_ids:
                         observations[agent_id]['state'] = self.sim.get_agent(agent_id=agent_id).get_state()
                         poses[agent_id].append(_get_pose(observations[agent_id]['state']))
 
-                    if self.log_rerun:
-                        for agent_id in agents_ids:
+                        if self.log_rerun:
                             cam_x = -self.sim.get_agent(agent_id).get_state().position[2]
                             cam_y = -self.sim.get_agent(agent_id).get_state().position[0]
                             rr.log(f"agent_{agent_id}/camera/rgb", rr.Image(observations[agent_id]["rgb"]))
                             rr.log(f"agent_{agent_id}/camera/depth", rr.Image(_normalize(observations[agent_id]["depth"])))
                             rr.log(f"agent_{agent_id}/camera/target", rr.Points2D(positions=[[125, 10]], labels=[f"Target: {current_obj}"], colors=[[255,255,255]]))
-                            self.logger.log_pos(cam_x, cam_y, agent_id)
-
-                    actions, called_found = self.actor.act(observations)
+                            self.logger.log_pos(self.actor.mappers[agent_id].projection, cam_x, cam_y, agent_id)
+                    actions, agent_called_found, nav_goals = self.actor.act(observations)
                     self.execute_action(actions)
 
                     if self.log_rerun:
@@ -630,15 +319,15 @@ class HabitatMultiEvaluator:
                             self.scene_data[episode.scene_id].object_locations[current_obj],
                             self.is_gibson
                         ) for agent_id in agents_ids]
-                        pbar.desc = f"Step {steps}, current object: {current_obj}, episode_id: {episode.episode_id}/{len(self.episodes)}, distance to closest object: {np.min(dists)}"
+                        pbar.desc = f"Step {steps}, current object: {current_obj}, episode_id: {episode.episode_id + 1}/{len(self.episodes)}, distance to closest object: {np.min(dists)}"
                     steps += 1
                     pbar.update(1)
 
-                if called_found:
+                if agent_called_found != -1:
                     dists = [get_closest_dist(self.sim.get_agent(agent_id).get_state().position[[0, 2]],
                                             self.scene_data[episode.scene_id].object_locations[current_obj],
                                             self.is_gibson) for agent_id in agents_ids]
-                    if np.min(dists) < self.max_dist:
+                    if np.min(dists) < self.config.max_dist:
                         result = Result.SUCCESS
                         pbar.write(f"Object {current_obj} found!")
                     else:
@@ -648,10 +337,12 @@ class HabitatMultiEvaluator:
                             pos = mapper.chosen_detection
                             if pos is not None:
                                 pos_metric = self._px_to_metric(pos[0], pos[1])
-                                dists_detect.append(get_closest_dist([-pos_metric[1], -pos_metric[0]],
-                                                            self.scene_data[episode.scene_id].object_locations[current_obj],
-                                                            self.is_gibson))
-                        if np.min(dists_detect) < self.max_dist:
+                                dists_detect.append(get_closest_dist(
+                                    [-pos_metric[1], -pos_metric[0]],
+                                    self.scene_data[episode.scene_id].object_locations[current_obj],
+                                    self.is_gibson
+                                ))
+                        if np.min(dists_detect) < self.config.max_dist:
                             result = Result.FAILURE_NOT_REACHED
                         else:
                             result = Result.FAILURE_MISDETECT
@@ -659,18 +350,17 @@ class HabitatMultiEvaluator:
                     
                 else:
                     failed = True
-                    num_frontiers = np.sum([len(mapper.nav_goals) for mapper in self.actor.mappers])
 
                     if _is_stuck(poses, agents_ids):
                         result = Result.FAILURE_STUCK
-                    elif num_frontiers == 0:
+                    elif len(nav_goals) == 0:
                         result = Result.FAILURE_ALL_EXPLORED
                     else:
                         result = Result.FAILURE_OOT
                     
                     pbar.write(f"Out of time to find object {current_obj}!")
 
-                results[-1].add_sequence(poses, result, current_obj)
+                results[-1].add_sequence(poses, result, agent_called_found, current_obj)
 
                 self.save_final_sims(episode.episode_id, sequence_id, poses)
 
@@ -685,3 +375,5 @@ class HabitatMultiEvaluator:
 
             with open(f"{self.results_path}/state/state_{episode.episode_id}.txt", 'w') as f:
                 f.write(','.join(str(results[n_ep].sequence_results[i].value) for i in range(len(results[n_ep].sequence_results))))
+                f.write('\n')
+                f.write(','.join(str(results[n_ep].sequence_agent_finding[i]) for i in range(len(results[n_ep].sequence_results))))

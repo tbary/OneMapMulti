@@ -105,43 +105,4 @@ class BLIP2PatchedModel(BLIP2Model):
         return corr
 
 if __name__ == "__main__":
-    from PIL import Image
-
-    rr.init("BLIP2 Batched", spawn=False)
-    rr.connect("127.0.0.1:9876")
-    rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)  # Set an up-axis
-    rr.log(
-        "world/xyz",
-        rr.Arrows3D(
-            vectors=[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-            colors=[[255, 0, 0], [0, 255, 0], [0, 0, 255]],
-        ),
-    )
-
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    blip = BLIP2PatchedModel()
-    # img = read_image('/home/finn/ovseg/ov-seg/bottles.png', format="BGR")
-    url1 = "https://media.architecturaldigest.com/photos/62f3c04c5489dd66d1d538b9/16:9/w_2240,c_limit/_Hall_St_0256_v2.jpeg"
-    # url1 = "https://static.asianpaints.com/content/dam/asianpaintsbeautifulhomes/202211/bedroom-design-for-better-sleep/title-bed-for-good-sleep.jpg"
-    image1 = Image.open(requests.get(url1, stream=True).raw)
-
-
-    img = np.array(image1)[:,:, :3]
-    img = img.transpose(2, 0, 1)
-    img = img[np.newaxis, :, :, :]
-    img_feats_ = blip.get_image_features(img)
-
-    start.record()
-    img_feats = blip.get_image_features(img)
-    end.record()
-    torch.cuda.synchronize()
-
-    print("Complete forward: ", start.elapsed_time(end) / 1000)
-    # TODO TEST PATCH FEATS, COMPARE WITH CLIPTEST IMPLEMENTATION
-    txt_feats = blip.get_text_features(["A potted plant"])
-    sim = blip.compute_similarity(img_feats, txt_feats).squeeze()
-    rr.log("map", rr.Tensor((sim - sim.min())/(sim.max() - sim.min()), dim_names=("x", "y")))
-    rr.log("map", rr.Tensor(sim, dim_names=("x", "y")))
-    rr.log("reference_image", rr.Image(img[0].transpose(1, 2, 0)))
-
+    pass

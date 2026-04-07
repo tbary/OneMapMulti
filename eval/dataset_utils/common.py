@@ -2,15 +2,22 @@ from dataclasses import dataclass
 
 # typing
 from typing import List, Dict, Union, Optional
+import enum
 
-import numpy as np
+class Result(enum.Enum):
+    SUCCESS = 1
+    FAILURE_MISDETECT = 2
+    FAILURE_STUCK = 3
+    FAILURE_OOT = 4
+    FAILURE_NOT_REACHED = 5
+    FAILURE_ALL_EXPLORED = 6
 
 @dataclass
 class SemanticObject:
     object_id: str  # unique identifier
     object_category: str
     bbox: List[float]
-    semantic_id: Optional = None
+    semantic_id: Optional[int] = None
     view_pts: Union[List, None] = None
 
     def __eq__(self, other):

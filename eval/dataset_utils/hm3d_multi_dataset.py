@@ -1,7 +1,7 @@
 from eval.dataset_utils import Episode, SceneData, SemanticObject
 
 # typing
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 # fs utils
 import os
@@ -10,7 +10,7 @@ import gzip
 import json
 
 
-def load_hm3d_multi_episodes(episodes: List[Episode], scene_data: Dict[str, SceneData], object_nav_path: str):
+def load_hm3d_multi_episodes(episodes: List[Episode], scene_data: Dict[str, SceneData], object_nav_path: str)->Tuple[List[Episode], Dict[str, SceneData]]:
     """
     Loads the generated multiobject episodes, see gen_multiobject_dataset.py
     """

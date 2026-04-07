@@ -25,7 +25,7 @@ from typing import List, Union
 import torch
 
 # navgoal
-from mapping.nav_goals.navigation_goals import NavGoal
+from .navigation_goals import NavGoal
 
 
 @dataclass
@@ -36,6 +36,7 @@ class Cluster(NavGoal):
     center: np.ndarray
     points: np.ndarray
     cluster_score: float
+    cluster_explore_score: float
 
     def __repr__(self):
         return f"Cluster(center={self.center}, points={self.points}, score={self.cluster_score})"
@@ -45,6 +46,9 @@ class Cluster(NavGoal):
 
     def get_score(self):
         return self.cluster_score
+    
+    def get_explore_score(self):
+        return self.cluster_explore_score
 
     def get_descr_point(self):
         return self.center
@@ -53,6 +57,8 @@ class Cluster(NavGoal):
         # score is the max score in the cluster
         self.cluster_score = np.max(score_map[self.points[:, 0], self.points[:, 1]])
 
+    def compute_explore_score(self, confidence_map:np.ndarray):
+        self.cluster_explore_score = 1 / (np.median(confidence_map[self.points[:, 0], self.points[:, 1]]) + 1e-7)
 
 # Include the previous clustering functions here
 def find_local_maxima(similarity_map, mask, neighborhood_size=10):
@@ -122,7 +128,7 @@ def cluster_high_similarity_regions(
             cluster_points = np.array(cluster_points)
             # Set center as the point with maximum similarity
             center = np.array(max_similarity_point)
-            clusters.append(Cluster(center=center, points=cluster_points, cluster_score=cluster_score))
+            clusters.append(Cluster(center=center, points=cluster_points, cluster_score=cluster_score, cluster_explore_score=0))
 
     return clusters
 

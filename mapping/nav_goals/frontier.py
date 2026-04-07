@@ -14,7 +14,7 @@ from typing import List, Optional
 import rerun as rr
 
 # mapping
-from mapping.nav_goals.navigation_goals import NavGoal
+from .navigation_goals import NavGoal
 
 from dataclasses import dataclass
 
@@ -23,15 +23,22 @@ class Frontier(NavGoal):
     frontier_midpoint: np.ndarray
     points: np.ndarray
     frontier_score: float
+    frontier_explore_score: float
 
-    def __eq__(self, other):
+    def __eq__(self, other: "Frontier"):
         return np.all(self.frontier_midpoint == other.frontier_midpoint)
 
     def get_score(self):
         return self.frontier_score
 
+    def get_explore_score(self):
+        return self.frontier_explore_score
+
     def get_descr_point(self):
         return self.frontier_midpoint
+
+    def compute_explore_score(self, confidence_map:np.ndarray):
+        self.frontier_explore_score = 1 / (np.median(confidence_map[self.points[:, 0], self.points[:, 1]]) + 1e-7)
 
 def _bresenhamline_nslope(slope):
     """
@@ -55,7 +62,6 @@ def _bresenhamline_nslope(slope):
     normalizedslope = np.array(slope, dtype=np.double) / scale
     normalizedslope[zeroslope] = np.zeros(slope[0].shape)
     return normalizedslope
-
 
 def _bresenhamlines(start, end, max_iter):
     """

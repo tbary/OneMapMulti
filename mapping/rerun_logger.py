@@ -5,16 +5,13 @@ import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
 
-from mapping import OneMap
+from .feature_map import OneMap, rotate_frame
+from .projection import Projection
 from onemap_utils import log_map_rerun
-
 
 def log_pos(x, y, agent):
     agents_colors = [[255,0,0],[0,255,0],[0,0,255]]
     rr.log(f"map/agent_{agent}/position", rr.Points2D(rotate_frame([[x, y]]), colors=[agents_colors[agent]], radii=[2]))
-
-def rotate_frame(points):
-    return [[y, x] for (x, y) in points]
 
 def setup_blueprint_debug(n_agents):
     my_blueprint = rrb.Blueprint(
@@ -30,7 +27,11 @@ def setup_blueprint_debug(n_agents):
             rrb.Vertical(
                 rrb.Vertical(
                     rrb.TextLogView(origin="object_detections"),
-                    rrb.TextLogView(origin="path_updates"),
+                    rrb.Tabs(*[
+                        rrb.TextLogView(origin="path_updates"),
+                        rrb.TextLogView(origin="actions_updates"),
+                        rrb.Spatial3DView(origin="embeddings")
+                    ]),
                 ),
             ),
             rrb.Vertical(
@@ -39,7 +40,9 @@ def setup_blueprint_debug(n_agents):
                                         name="Similarity",
                                         contents=
                                         ["$origin/similarity/",
-                                         "$origin/frontiers",
+                                         "$origin/frontiers_and_POIs",
+                                         "$origin/artificial_obstacles",
+                                         "$origin/invalid_frontiers",
                                         *[f"$origin/agent_{i}/proj_detect" for i in range(n_agents)],
                                         *[f"$origin/agent_{i}/position" for i in range(n_agents)]]),
                       rrb.Spatial2DView(origin="map",
@@ -49,12 +52,12 @@ def setup_blueprint_debug(n_agents):
                                          *[f"$origin/agent_{i}/proj_detect" for i in range(n_agents)],
                                          *[f"$origin/agent_{i}/position" for i in range(n_agents)]]),
                       rrb.Spatial2DView(origin="map",
-                                        name="SimilarityTresholdedCl",
+                                        name="Confidence",
                                         contents=
-                                        ["$origin/similarity_th2/",
+                                        ["$origin/confidence/",
                                          *[f"$origin/agent_{i}/proj_detect" for i in range(n_agents)],
                                          *[f"$origin/agent_{i}/position" for i in range(n_agents)]]),
-                      ],
+                    ],
                 ),
                 rrb.Tabs(
                     rrb.Spatial2DView(origin="map",
@@ -62,7 +65,8 @@ def setup_blueprint_debug(n_agents):
                                       contents=["$origin/explored",
                                                 "$origin/largest_contour",
                                                 "$origin/ground_truth",
-                                                "$origin/frontiers",
+                                                "$origin/candidate",
+                                                *[f"$origin/agent_{i}/frontiers_dispatch" for i in range(n_agents)],
                                                 *[f"$origin/agent_{i}/position" for i in range(n_agents)],
                                                 *[f"$origin/agent_{i}/goal_pos" for i in range(n_agents)],
                                                 *[f"$origin/agent_{i}/path" for i in range(n_agents)],
@@ -75,6 +79,14 @@ def setup_blueprint_debug(n_agents):
                                                 "$origin/largest_contour",
                                                 "$origin/unexplored",
                                                 *[f"$origin/agent_{i}/position" for i in range(n_agents)]]),
+                    rrb.Spatial2DView(origin="map",
+                                        name="Discovery",
+                                        contents=
+                                        ["$origin/discovery",
+                                         "$origin/largest_contour",
+                                         *[f"$origin/agent_{i}/position" for i in range(n_agents)],
+                                        ]),
+                                         
                 ),
             ),
         ),
@@ -149,7 +161,7 @@ class RerunLogger:
 
     def log_map(self):
         confidences = self.one_map.confidence_map.cpu().numpy()
-        similarities = (self.one_map.get_similarity_map() + 1.0) / 2.0
+        similarities = (self.one_map.similarity_map + 1.0) / 2.0
 
         explored = (self.one_map.navigable_map == 1).astype(np.float32) * 0.1
         explored[confidences > 0] = 0.5
@@ -157,8 +169,8 @@ class RerunLogger:
         explored[self.one_map.navigable_map == 0] = 0
 
         log_map_rerun(explored, path="map/explored")
-        log_map_rerun(similarities[0], path="map/similarity")
+        log_map_rerun(similarities, path="map/similarity")
 
-    def log_pos(self, x, y, agent):
-        px, py = self.one_map.metric_to_px(x, y)
+    def log_pos(self, projection:Projection, x, y, agent):
+        px, py = projection.metric_to_px(x, y)
         log_pos(px, py, agent)

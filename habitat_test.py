@@ -16,21 +16,19 @@ import rerun.blueprint as rrb
 from habitat_sim import ActionSpec, ActuationSpec
 from numpy.lib.function_base import angle
 
-# keyboard input
-# from pynput import keyboard
+from typing import List
 
 # scipy
 from scipy.spatial.transform import Rotation as R
 
 # MON
-from mapping import Navigator
 from vision_models.clip_dense import ClipModel
 from vision_models.yolo_world_detector import YOLOWorldDetector
 
 # from onemap_utils import log_map_rerun
 from planning import Planning, Controllers
 from config import *
-from mapping import rerun_logger, OneMap
+from mapping import rerun_logger, OneMap, Navigator, Projection
 
 # Global variables
 running = True
@@ -57,7 +55,7 @@ def _reset_agent_pos(sim: habitat_sim.Simulator, agent_id: int):
 
     agent.set_state(state)
 
-def transformation_matrix(state):
+def transformation_matrix(state, pos):
     pitch = _pitch_yaw_roll(state)[0]
     # pitch is actually around z
     r = R.from_euler("xyz", [0, 0, pitch])
@@ -65,7 +63,7 @@ def transformation_matrix(state):
     transformation_matrix = np.hstack((r, pos))
     transformation_matrix = np.vstack((transformation_matrix, np.array([0, 0, 0, 1])))
 
-    return transformation_matrix
+    return transformation_matrix.astype(np.float32)
 
 def configure_habitat(hm3d_path, hfov=90, res_x=640, res_y=640, n_agents=1):
     backend_cfg = habitat_sim.SimulatorConfiguration()
@@ -128,25 +126,24 @@ if __name__ == "__main__":
     agents_ids = list(range(config.n_agents))
     qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"] 
 
-    if type(config.controller) == HabitatControllerConf:
-        pass
-    else:
+    if type(config.controller) != HabitatControllerConf:
         raise NotImplementedError("Spot controller not suited for habitat sim")
 
     model = ClipModel("weights/clip.pth")
     detector = YOLOWorldDetector(0.3)
 
-    onemap = OneMap(model.feature_dim, config.mapping, map_device="cpu")
+    onemap = OneMap(config.n_agents, model.feature_dim, config.mapping, map_device="cpu")
+    projection = Projection(model.feature_dim, config.mapping)
     logger = rerun_logger.RerunLogger(onemap, False, "", config.n_agents, debug=False) if config.log_rerun else None
 
     sim, K = configure_habitat("datasets/scene_datasets/hm3d", hfov=90, res_x=640, res_y=640, n_agents=config.n_agents)
     controller = Controllers.HabitatController(sim, config.controller)
 
-    mappers = []
+    mappers:List[Navigator] = []
     for a in agents_ids:
-        mapper = Navigator(model, detector, onemap, config, a)
+        mapper = Navigator(model, detector, onemap, projection, config, a)
         mapper.set_query(["A Couch"])
-        mapper.set_camera_matrix(K)
+        mapper.projection.set_camera_matrix(K)
         mappers.append(mapper)
 
     initial_sequences = [["turn_left"] * 56 for _ in agents_ids]
@@ -167,33 +164,60 @@ if __name__ == "__main__":
                 state = sim.get_agent(a).get_state()
 
                 current_pos = np.array([[-state.position[2]], [-state.position[0]], [state.position[1]]])
-                path = mapper.get_path()
+                path = mapper.path
 
                 if path and len(path) > 1:
                     path = Planning.simplify_path(np.array(path))
                     path = path.astype(np.float32)
                     for i in range(path.shape[0]):
-                        path[i, :] = mapper.one_map.px_to_metric(path[i, 0], path[i, 1])
+                        path[i, :] = mapper.projection.px_to_metric(path[i, 0], path[i, 1])
                     # pitch is actually around z
                     # orientation is pitch!
                     controller.control(a, current_pos, _pitch_yaw_roll(state)[0], path)
             observations = sim.get_sensor_observations(agent_ids=agents_ids)
 
+        obj_detected = np.zeros(len(mappers), dtype=bool)
         for a, mapper in enumerate(mappers):
             state = sim.get_agent(a).get_state()
             pos = np.array(([[-state.position[2]], [-state.position[0]], [state.position[1]]]))
 
-            t = time.time()
-            obj_found = obj_found or mapper.add_data(observations[a]["rgb"][..., :-1].transpose(2, 0, 1), observations[a]["depth"].astype(np.float32), transformation_matrix(state))
-            print("Time taken to add data: ", time.time() - t)
-            mapper.update_map()
+            image = observations[a]["rgb"][..., :-1].transpose(2, 0, 1)
+            depth = observations[a]["depth"].astype(np.float32)
+            odometry = transformation_matrix(state, pos)
+
+            current_pos = np.array(projection.metric_to_px(odometry[0, 3], odometry[1, 3]), dtype=int)
+            yaw = np.arctan2(odometry[1, 0], odometry[0, 0])
+            mapper.one_map.update_agent_pose((*current_pos,yaw), mapper.agent_id)
+
+            mapper.add_data(image, depth, odometry)
+            obj_detected[a] = mapper.check_object_in_image(image, depth, odometry)
 
             if logger:
                 rr.log(f"agent_{a}/camera/rgb", rr.Image(observations[a]["rgb"]))
                 rr.log(f"agent_{a}/camera/depth", rr.Image(_normalize(observations[a]["depth"])))
                 rr.log(f"agent_{a}/camera/target", rr.Points2D(positions=[[125, 10]], labels=[f"Target: {mapper.query_text[0]}"], colors=[[255,255,255]]))
                 logger.log_map()
-                logger.log_pos(pos[0, 0], pos[1, 0], a)
+                logger.log_pos(projection, pos[0, 0], pos[1, 0], a)
+
+        has_frontiers = mappers[0].one_map.compute_frontiers_and_POIs()
+        assigned_nav_goals = mappers[0].one_map.split_frontiers_and_POIs(obj_detected)
+
+        # Plan
+        for a, mapper in enumerate(mappers):
+            state = sim.get_agent(a).get_state()
+            pos = np.array(([[-state.position[2]], [-state.position[0]], [state.position[1]]]))
+            odometry = transformation_matrix(state, pos)
+            current_pos = np.array(projection.metric_to_px(odometry[0, 3], odometry[1, 3]), dtype=int)
+
+            if mapper.object_detected:
+                obj_found = mapper.check_object_reached(current_pos) or obj_found
+
+            else:
+                if mapper.config.planner.allow_replan and has_frontiers:
+                    mapper.compute_best_path_to_frontier(current_pos, assigned_nav_goals[a])
+
+            yaw = np.arctan2(odometry[1, 0], odometry[0, 0])
+            mapper.last_pose = (*current_pos, yaw)
 
         if obj_found:
             obj_found = False

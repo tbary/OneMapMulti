@@ -16,6 +16,7 @@ class EvalConf:
     planner: PlanningConf
     object_nav_path: str
     scene_path: str
+    results_path: str
     use_pointnav: bool
     square_im: bool
 

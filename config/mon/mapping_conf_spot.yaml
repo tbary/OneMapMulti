@@ -15,3 +15,5 @@ MappingConf: # [all in feature_map.py]
   filter_stairs: False
   floor_level: -0.88
   floor_threshold: -1.1
+  frontier_depth: 3.0 # in meters
+  log_rerun: True

@@ -2,6 +2,8 @@ from spock import spock
 
 @spock
 class MappingConf:
+    log_rerun: bool
+
     n_points: int
     size: int
     agent_radius: float
@@ -12,6 +14,7 @@ class MappingConf:
 
     depth_factor: float
     gradient_factor: float
+    frontier_depth: float
 
     optimal_object_distance: float
     optimal_object_factor: float

@@ -377,6 +377,7 @@ def load_all_scene_data(sc, scenes, scene_data, viewpoint_conf, sim = None):
     if needs_close:
         sim.close()
     return needs_save
+
 def generate_dataset(datapath: str):
     viewpoint_conf = VPConf(1.0, 0.1, 0.05)
     # First, we load all the episodes of hm3d_objectnav_v2
@@ -419,8 +420,6 @@ def generate_dataset(datapath: str):
                         objects = np.random.choice(sorted(scenes[sc].floors[fl].object_categories), size=(num_objects, ), replace=False).tolist()
                         path = build_episode(sim, np.array(start_pos), objects, scenes[sc].floors[fl])
                         retries += 1
-                        # if path is None:
-                        #     print(f"Failed to generate path for {objects}")
                     if path is None:
                         print(f"Failed to generate path for scene {sc}, floor {fl} after {max_retries} retries.")
                         continue
@@ -442,11 +441,6 @@ def generate_dataset(datapath: str):
             # gzip and save
             with gzip.open(os.path.join(datapath, scene_path, f"{sim_name}_episodes.json.gz"), "wt") as f:
                 f.write(json_str)
-
-
-# def fix_geodesic():
-
-
 
 if __name__ == "__main__":
     generate_dataset("datasets/multiobject_episodes")

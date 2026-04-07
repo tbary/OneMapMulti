@@ -15,5 +15,9 @@ class NavGoal(ABC):
         pass
 
     @abstractmethod
+    def get_explore_score(self):
+        pass
+
+    @abstractmethod
     def get_descr_point(self):
         pass

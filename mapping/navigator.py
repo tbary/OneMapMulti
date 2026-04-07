@@ -4,10 +4,12 @@ for navigation and exploration.
 """
 import time
 
-from mapping import (OneMap, detect_frontiers, get_frontier_midpoint,
-                     cluster_high_similarity_regions, find_local_maxima,
-                     watershed_clustering, gradient_based_clustering, cluster_thermal_image,
-                     Cluster, NavGoal, Frontier)
+from .feature_map import rotate_frame
+from .feature_map import OneMap
+from .nav_goals.frontier import Frontier, detect_frontiers, get_frontier_midpoint
+from .nav_goals.clustering import Cluster, cluster_high_similarity_regions
+from .nav_goals.navigation_goals import NavGoal
+from .projection import Projection
 
 from planning import Planning
 from vision_models.base_model import BaseModel
@@ -21,7 +23,7 @@ from mobile_sam import sam_model_registry, SamPredictor
 import numpy as np
 
 # typing
-from typing import List, Optional, Set, Any, Union
+from typing import List, Optional, Set, Any, Union, Tuple
 
 # torch
 import torch
@@ -34,9 +36,6 @@ import rerun as rr
 
 # cv2
 import cv2
-
-def rotate_frame(points):
-    return [[y, x] for (x, y) in points]
 
 def closest_point_within_threshold(nav_goals: List[NavGoal], target_point: np.ndarray, threshold: float) -> int:
     """Find the point within the threshold distance that is closest to the target_point.
@@ -59,37 +58,6 @@ def closest_point_within_threshold(nav_goals: List[NavGoal], target_point: np.nd
         return int(closest_index)
 
     return -1
-
-class HistoricDetectData:
-    def __init__(self, position: np.ndarray, action: str, other: Any = None):
-        self.position = position
-        self.other = other
-        self.action = action
-
-    def __hash__(self) -> int:
-        string_repr = f"{self.position}_{self.action}_{self.other}"
-        return hash(string_repr)
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, HistoricDetectData):
-            return NotImplemented
-        return (np.array_equal(self.position, other.position) and
-                self.action == other.action and
-                self.other == other.other)
-
-
-class CyclicDetectChecker:
-    history: Set[HistoricDetectData] = set()
-
-    def check_cyclic(self, position: np.ndarray, action: str, other: Any = None) -> bool:
-        state_action = HistoricDetectData(position, action, other)
-        cyclic = state_action in self.history
-        return cyclic
-
-    def add_state_action(self, position: np.ndarray, action: str, other: Any = None) -> None:
-        state_action = HistoricDetectData(position, action, other)
-        self.history.add(state_action)
-
 
 class HistoricData:
     def __init__(self, position: np.ndarray, frontier_pt: np.ndarray, other: Any = None):
@@ -119,21 +87,18 @@ class Navigator:
     query_text: List[str]  # the query texts as a list. The first element will be used for planning and frontier score
     # computation
     query_text_features: torch.Tensor
-    points_of_interest: List[Cluster]
-    blacklisted_nav_goals: List[np.ndarray]
-    nav_goals: List[NavGoal]
     last_nav_goal: Union[NavGoal, None]
 
     def __init__(self,
                  model: BaseModel,
                  detector: YOLOWorldDetector,
                  one_map: OneMap,
+                 projection: Projection,
                  config: Conf,
                  agent_id: int
                  ) -> None:
 
         self.cyclic_checker = CyclicChecker()
-        self.cyclic_detect_checker = CyclicDetectChecker()
         self.config = config
         self.agent_id = agent_id
         self.agent_color = [[255,0,0],[0,255,0],[0,0,255]][agent_id]
@@ -147,48 +112,33 @@ class Navigator:
         self.sam_predictor = SamPredictor(self.sam)
 
         self.one_map = one_map
+        self.projection = projection
 
         self.query_text = ["Other."]
         self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
 
         # Frontier and POIs
-        self.nav_goals = []
-        self.blacklisted_nav_goals = []
-        self.artificial_obstacles = []
+        self.artificial_obstacles = set()
 
         self.last_nav_goal = None
         self.last_pose = None
-        self.saw_left = False
-        self.saw_right = False
 
         self.first_obs = True
         self.similar_points = None
         self.similar_scores = None
         self.object_detected = False
         self.chosen_detection = None
-        self.is_goal_path = False
         self.navigation_scores = np.zeros_like(self.one_map.navigable_map, dtype=np.float32)
         self.path = None
-        self.is_spot = type(config.controller) == SpotControllerConf
         self.initializing = True
         self.stuck_at_nav_goal_counter = 0
         self.stuck_at_cell_counter = 0
 
         self.percentile_exploitation = config.planner.percentile_exploitation
-        self.frontier_depth = int(config.planner.frontier_depth / self.one_map.cell_size)
         self.no_nav_radius = int(config.planner.no_nav_radius / self.one_map.cell_size)
         self.max_detect_distance = int(config.planner.max_detect_distance / self.one_map.cell_size)
         self.obstcl_kernel_size = int(config.planner.obstcl_kernel_size / self.one_map.cell_size)
         self.min_goal_dist = int(config.planner.min_goal_dist / self.one_map.cell_size)
-
-        self.path_id = 0
-        self.filter_detections_depth = config.planner.filter_detections_depth
-        self.consensus_filtering = config.planner.consensus_filtering
-
-        self.log = config.log_rerun
-        self.allow_replan = config.planner.allow_replan
-        self.use_frontiers = config.planner.use_frontiers
-        self.allow_far_plan = config.planner.allow_far_plan
 
         # For the closed-vocabulary object detector, not needed for OneMap
         self.class_map = {}
@@ -209,25 +159,17 @@ class Navigator:
         self.similar_scores = None
         self.object_detected = False
         self.chosen_detection = None
+        self.last_nav_goal = None
         self.last_pose = None
         self.stuck_at_nav_goal_counter = 0
         self.stuck_at_cell_counter = 0
-        self.is_goal_path = False
         self.navigation_scores = np.zeros_like(self.one_map.navigable_map, dtype=np.float32)
         self.path = None
-        self.path_id = 0
         self.initializing = True
         self.one_map.reset()
         self.first_obs = True
         self.cyclic_checker = CyclicChecker()
-        self.cyclic_detect_checker = CyclicDetectChecker()
-        self.points_of_interest = []
-        self.nav_goals = []
-        self.blacklisted_nav_goals = []
-        self.artificial_obstacles = []
-
-    def set_camera_matrix(self, camera_matrix: np.ndarray) -> None:
-        self.one_map.set_camera_matrix(camera_matrix)
+        self.artificial_obstacles = set()
 
     def set_query(self, txt: List[str]) -> None:
         """
@@ -248,221 +190,154 @@ class Navigator:
             self.object_detected = False
             self.update_map(reset=True)
 
-    def get_path(self) -> Union[np.ndarray, str]:
-        if not self.path:
-            return None
-        if not self.object_detected:
-            if self.saw_left:
-                return "L"
-            if self.saw_right:
-                return "R"
-        return self.path[min(self.path_id, len(self.path)):]
+    def compute_best_path_to_object(self, start:np.ndarray) -> bool:
+        if np.linalg.norm(start - self.chosen_detection) < self.max_detect_distance:
+            self.path = [start] * 5
+            # We are close to the object, we don't need to move
+            return True
 
-    def compute_best_path(self,
-                          start: np.ndarray) -> None:
-        """
-        Computes the best path from the start point to a point on a frontier, or a point of interest
-        :param start: start point as [X, Y]
-        :return:
-        """
-        self.path_id = 0
-        if not self.object_detected:
-            # We are exploring
-            if len(self.nav_goals) == 0:
-                if not self.initializing:
-                    self.one_map.reset_checked_map()  # We need new points of interest
-                    self.compute_frontiers_and_POIs(start[0], start[1])
-            # If we still have no nav goals, we can't plan anything
-            if len(self.nav_goals) == 0:
-                return
-            self.initializing = False
-            self.is_goal_path = False
-            self.path = None
-            while self.path is None and len(self.nav_goals) > 0:
-                best_idx = None
-                if len(self.nav_goals) == 1:
-                    top_two_vals = tuple((self.nav_goals[0].get_score(), self.nav_goals[0].get_score()))
-                else:
-                    top_two_vals = tuple((self.nav_goals[0].get_score(), self.nav_goals[1].get_score()))
+        self.path = Planning.compute_to_goal(
+            start, 
+            self.one_map.navigable_map,
+            (self.one_map.confidence_map > 0).cpu().numpy(),
+            self.chosen_detection,
+            self.obstcl_kernel_size, 
+            self.min_goal_dist
+        )
 
-                # We have a frontier and we need to consider following up on that
-                curr_index = None
-                if self.last_nav_goal is not None:
-                    last_pt = self.last_nav_goal.get_descr_point()
-                    for nav_id in range(len(self.nav_goals)):
-                        if np.array_equal(last_pt, self.nav_goals[nav_id].get_descr_point()):
-                            # frontier still exists!
-                            curr_index = nav_id
-                            break
-                    if curr_index is None:
-                        closest_index = closest_point_within_threshold(self.nav_goals, last_pt,
-                                                                       0.5 / self.one_map.cell_size)
-                        if closest_index != -1:
-                            curr_index = closest_index
-                            # there is a close point to the previous frontier that we could consider instead
-                    if curr_index is not None:
-                        curr_value = self.nav_goals[curr_index].get_score()
-                        if curr_value + 0.01 > self.last_nav_goal.get_score():
-                            best_idx = curr_index
-                if best_idx is None:
-                    # Select the current best nav_goal, and check for cyclic
-                    for nav_id in range(len(self.nav_goals)):
-                        nav_goal = self.nav_goals[nav_id]
-                        cyclic = self.cyclic_checker.check_cyclic(start, nav_goal.get_descr_point(), top_two_vals)
-                        if cyclic:
-                            continue
-                        best_idx = nav_id
-                        # rr.log("path_updates", rr.TextLog(f"Selected frontier or POI based on score {self.frontiers[best_idx, 2]}. Max score is {self.frontiers[0, 2]}"))
-
-                        break
-                # TODO We should check if the chosen waypoint is reachable via simple path planning!
-                best_nav_goal = self.nav_goals[best_idx]
-                self.cyclic_checker.add_state_action(start, best_nav_goal.get_descr_point(), top_two_vals)
-                if isinstance(best_nav_goal, Frontier):
-                    self.path = Planning.compute_to_goal(start, self.one_map.navigable_map & (
-                            self.one_map.confidence_map > 0).cpu().numpy(),
-                                                         (self.one_map.confidence_map > 0).cpu().numpy(),
-                                                         best_nav_goal.get_descr_point(),
-                                                         self.obstcl_kernel_size, 2)
-                elif isinstance(best_nav_goal, Cluster):
-                    self.path = Planning.compute_to_goal(start, self.one_map.navigable_map & (
-                            self.one_map.confidence_map > 0).cpu().numpy(),
-                                                         (self.one_map.confidence_map > 0).cpu().numpy(),
-                                                         best_nav_goal.get_descr_point(),
-                                                         # TODO we might want to consider all the points of the cluster!
-                                                         self.obstcl_kernel_size, 4)
-                if self.path is None:
-                    # remove the nav goal from the list, we don't know how to reach it
-                    self.nav_goals.pop(best_idx)
-            if self.path is None:
-                if not self.initializing:
-                    if self.log:
-                        rr.log("path_updates", rr.TextLog(f"Resetting checked map as no path found."))
-                    self.one_map.reset_checked_map()
-            if self.last_nav_goal is not None and not np.array_equal(self.last_nav_goal.get_descr_point(),
-                                                                     best_nav_goal.get_descr_point()):
-                self.stuck_at_nav_goal_counter = 0
-            else:
-                if self.last_pose is not None:
-                    if self.path is not None:
-                        if len(self.path) < 5 and self.last_pose[0] == start[0] and self.last_pose[1] == start[1]:
-                            self.stuck_at_nav_goal_counter += 1
-            if self.stuck_at_nav_goal_counter > 10:
-                # We probably are trying to reach an unreachable goal, for instance a frontier to the void in habitat
-                self.blacklisted_nav_goals.append(best_nav_goal.get_descr_point())
-                if self.log:
-                    rr.log("path_updates", rr.TextLog(f"Frontier at position {best_nav_goal.get_descr_point()[0]}"
-                                                      f",{best_nav_goal.get_descr_point()[1]} invalid."))
-            self.last_nav_goal = best_nav_goal
-
-            if self.path:
-                if self.log:
-                    rr.log("path_updates", rr.TextLog(f"Computed path of length {len(self.path)}"))
-                    rr.log(f"map/agent_{self.agent_id}/path", rr.LineStrips2D(rotate_frame(self.path), colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
-                                                                                   len(self.path), axis=0)))
+        if self.path and len(self.path) > 0:
+            if self.config.log_rerun:
+                rr.log(
+                    f"map/agent_{self.agent_id}/path", 
+                    rr.LineStrips2D(
+                        rotate_frame(self.path), 
+                        colors=np.repeat(np.array([0, 255, 0])[np.newaxis, :],
+                        len(self.path), axis=0)
+                    )
+                )
+                rr.log("path_updates",rr.TextLog(f"Path to object {self.query_text[0]} of length {len(self.path)} computed."))
+            return True
+        
         else:
-            # We go to an object
-            if np.linalg.norm(start - self.chosen_detection) < self.max_detect_distance:
-                self.path = [start] * 5
-                # We are close to the object, we don't need to move
-                return
-            self.path = Planning.compute_to_goal(start, self.one_map.navigable_map,
-                                                 (self.one_map.confidence_map > 0).cpu().numpy(),
-                                                 self.chosen_detection,
-                                                 self.obstcl_kernel_size, self.min_goal_dist)
-            self.is_goal_path = True
-            if self.path and len(self.path) > 0:
-                if self.log:
-                    rr.log(f"map/agent_{self.agent_id}/path", rr.LineStrips2D(rotate_frame(self.path), colors=np.repeat(np.array([0, 255, 0])[np.newaxis, :],
-                                                                                   len(self.path), axis=0)))
-                    rr.log("path_updates",
-                           rr.TextLog(f"Path to object {self.query_text[0]} of length {len(self.path)} computed."))
-            else:
-                self.object_detected = False
-                if self.log:
-                    rr.log("path_updates", rr.TextLog(f"No path to object {self.query_text[0]} found."))
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(f"No path to object {self.query_text[0]} found."))
+            return False
 
-    def compute_frontiers_and_POIs(self, px, py):
-        """
-        Computes the frontiers (at the border from fully explored to confidence > 0),
-        and points of interest (high similarity regions within the fully explored, but not checked map)
-        :return:
-        """
-        self.nav_goals = []
-        if self.one_map.previous_sims is not None:
-            # Compute the frontiers
-            frontiers, unexplored_map, largest_contour = detect_frontiers(
-                self.one_map.navigable_map.astype(np.uint8),
-                self.one_map.fully_explored_map.astype(np.uint8),
-                self.one_map.confidence_map > 0,
-                int(1.0 * ((
-                                   self.one_map.n_cells /
-                                   self.one_map.size) ** 2)))
+    def _check_previous_frontier(self, assigned_nav_goals: List[NavGoal]):
+        if self.last_nav_goal is None:
+            return None, None
+        
+        last_point = self.last_nav_goal.get_descr_point()
 
-            # moreover we compute points of interest. These are high similarity regions within the fully explored,
-            # but not checked map
-            # For that we make use of the cluster_high_similarity_regions function, and project the points to the
-            # navigable map
-            adjusted_score = self.one_map.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
-            map_def = self.one_map.previous_sims[0].numpy()
-            normalized_map = (map_def - map_def.min()) / (map_def.max() - map_def.min())
-            # TODO This will give us wrong cluster scores, we will need to adjust this to match the frontier scores!
-            clusters = cluster_high_similarity_regions(normalized_map,
-                                                       (self.one_map.confidence_map > 0.0).cpu().numpy())
-            # clusters = cluster_high_similarity_regions(normalized_map, map_def > 0.0)
-            for cluster in clusters:
-                cluster.compute_score(adjusted_score)
-                if len(self.blacklisted_nav_goals) == 0 or not np.any(
-                        np.all(cluster.get_descr_point() == self.blacklisted_nav_goals, axis=1)):
-                    if ((largest_contour is None or cv2.pointPolygonTest(largest_contour, cluster.center.astype(float),
-                                                                         measureDist=True) > -15.0) or
-                        self.one_map.fully_explored_map[cluster.center[0], cluster.center[1]]) and \
-                            (not self.one_map.checked_map[cluster.center[0], cluster.center[1]]):
-                        self.nav_goals.append(cluster)
-            if self.log:
-                cluster_max_similarity = np.zeros_like(self.one_map.previous_sims[0])
+        # Exact match
+        current_index = None
+        for i, goal in enumerate(assigned_nav_goals):
+            if np.array_equal(last_point, goal.get_descr_point()):
+                current_index = i
+                break
 
-                # Fill each cluster with its maximum similarity value
-                min_c = np.min([cluster.get_score() for cluster in clusters])
-                max_c = np.max([cluster.get_score() for cluster in clusters])
-                for cluster in clusters:
-                    cluster_pts = cluster.points
-                    score = (cluster.get_score() - min_c) / (max_c - min_c)
-                    cluster_max_similarity[cluster_pts[:, 0], cluster_pts[:, 1]] = score
-                log_map_rerun(cluster_max_similarity, path="map/similarity_th2")
+        # Nearby match
+        if current_index is None:
+            closest_index = closest_point_within_threshold(
+                assigned_nav_goals,
+                last_point,
+                0.5 / self.one_map.cell_size
+            )
+            if closest_index == -1:
+                return None, None
+            
+            current_index = closest_index
 
-            if self.log:
-                log_map_rerun(unexplored_map, path="map/unexplored")
+        current_score = assigned_nav_goals[current_index].get_score()
+        previous_score = self.last_nav_goal.get_score()
 
-            frontiers = [f[:, :, ::-1] for f in frontiers]  # need to flip coords for some reason
-            adjusted_score_frontier = adjusted_score.copy()
+        # Check if goal still worth pursuing
+        if current_score + 0.01 > previous_score:
+            return current_index, assigned_nav_goals[current_index]
 
-            # set the score of the fully explored map to 0 for the frontiers
-            valid_frontiers_mask = np.zeros((len(frontiers),), dtype=bool)
+        return None, None
 
-            for i_frontier, frontier in enumerate(frontiers):
-                frontier_mp = get_frontier_midpoint(frontier).astype(np.uint32)
-                score, n_els, best_reachable, reachable_area = Planning.compute_reachable_area_score(
-                    frontier_mp,
-                    (self.one_map.confidence_map > 0).cpu().numpy(),
-                    adjusted_score_frontier,
-                    self.frontier_depth)
-                frontier_mp = np.round(frontier_mp)
-                if len(self.blacklisted_nav_goals) == 0 or not np.any(
-                        np.all(frontier_mp == self.blacklisted_nav_goals, axis=1)):
-                    valid_frontiers_mask[i_frontier] = True
-                    self.nav_goals.append(
-                        Frontier(frontier_midpoint=frontier_mp, points=frontier, frontier_score=score))
+    def _get_current_nav_goal(self, start, assigned_nav_goals:List[NavGoal])->Tuple[int, Union[Frontier, Cluster]]:
+        # We have a frontier and we need to consider following up on that
+        nav_id, goal = self._check_previous_frontier(assigned_nav_goals)
 
-            if self.log:
-                if len(self.nav_goals) > 0:
-                    pts = np.array([nav_goal.get_descr_point() for nav_goal in self.nav_goals])
-                    scores = np.array([nav_goal.get_score() for nav_goal in self.nav_goals])
-                    rr.log("map/frontiers",
-                           rr.Points2D(rotate_frame(pts), colors=np.flip(monochannel_to_inferno_rgb(scores), axis=-1),
-                                       radii=[1] * pts.shape[0]))
+        if nav_id is not None:
+            return nav_id, goal
 
-            self.nav_goals = sorted(self.nav_goals, key=lambda x: x.get_score(), reverse=True)
+        second_idx = 0 if len(assigned_nav_goals) == 1 else 1
+        top_two_vals = tuple((assigned_nav_goals[0].get_score(), assigned_nav_goals[second_idx].get_score()))
+               
+        # Select the current best nav_goal, and check for cyclic
+        for nav_id, goal in enumerate(assigned_nav_goals):
+            # Check that the current goal is not in the previous goals
+            if not self.cyclic_checker.check_cyclic(start, goal.get_descr_point(), top_two_vals):
+                self.cyclic_checker.add_state_action(start, goal.get_descr_point(), top_two_vals)
+                return nav_id, goal
+
+    def compute_best_path_to_frontier(self, start: np.ndarray, assigned_nav_goals:List[NavGoal]):
+        self.path = None
+        while self.path is None and len(assigned_nav_goals) > 0:
+            best_idx, best_nav_goal = self._get_current_nav_goal(start, assigned_nav_goals)           
+
+            min_goal_dist = 2 if isinstance(best_nav_goal, Frontier) else 4
+
+            self.path = Planning.compute_to_goal(
+                start, 
+                self.one_map.navigable_map & (self.one_map.confidence_map > 0).cpu().numpy(),
+                (self.one_map.confidence_map > 0).cpu().numpy(),
+                best_nav_goal.get_descr_point(),
+                self.obstcl_kernel_size, 
+                min_goal_dist
+            )
+
+            if self.path is None:
+                # remove the nav goal from the list, we don't know how to reach it
+                assigned_nav_goals.pop(best_idx)
+
+        if self.path is None:
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(f"Resetting checked map as no path found."))
+            self.one_map.reset_checked_map()
+
+        self._free_unattainable_goal_agent(start, best_nav_goal)
+
+        if self.config.log_rerun:
+            similarity_mask = self._build_similarity_mask(kernel_size=3)
+            log_map_rerun(similarity_mask, path="map/similarity_th")
+            if self.path:
+                rr.log("path_updates", rr.TextLog(f"Agent {self.agent_id}: computed path of length {len(self.path)}"))
+                rr.log(f"map/agent_{self.agent_id}/path", 
+                    rr.LineStrips2D(
+                        rotate_frame(self.path), 
+                        colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
+                        len(self.path), axis=0)
+                    )
+                )
+                pts = np.array([nav_goal.get_descr_point() for nav_goal in assigned_nav_goals])
+                rr.log(
+                    f"map/agent_{self.agent_id}/frontiers_dispatch",
+                    rr.Points2D(rotate_frame(pts), colors=self.agent_color,radii=[1] * pts.shape[0])
+                )
+
+    def _free_unattainable_goal_agent(self, start, best_nav_goal:Union[Frontier, Cluster]):
+        nav_goal_coords = best_nav_goal.get_descr_point()
+
+        if self.last_nav_goal is not None and not np.array_equal(self.last_nav_goal.get_descr_point(), nav_goal_coords):
+            self.stuck_at_nav_goal_counter = 0
+
+        elif self.last_pose is not None and self.path is not None:
+            if np.array_equal(self.last_pose[:-1], start) and len(self.path) < 5:
+                self.stuck_at_nav_goal_counter += 1
+
+        if self.stuck_at_nav_goal_counter > 10:
+            # We probably are trying to reach an unreachable goal, for instance a frontier to the void in habitat
+            self.one_map.blacklisted_nav_goals.append(nav_goal_coords)
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(
+                    f"Frontier at position {nav_goal_coords[0]},{nav_goal_coords[1]} invalid.")
+                )
+                rr.log(f"map/invalid_frontiers", rr.Points2D(positions=rotate_frame(self.one_map.blacklisted_nav_goals), colors=[[0,0,0]], radii=[0.5]))
+        self.last_nav_goal = best_nav_goal
 
     def _free_stuck_agent(self, px, py, yaw):
         if self.last_pose:
@@ -483,9 +358,16 @@ class Navigator:
             # Calculate coordinates of facing cell
             facing_px = px + facing_dx
             facing_py = py + facing_dy
-            self.artificial_obstacles.append((facing_px, facing_py))
+            self.artificial_obstacles.add((facing_px, facing_py))
 
-    def _build_similarity_mask(self, adjusted_score, kernel_size=7):
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(
+                    f"Agent {self.agent_id} stuck at position {(px,py)}. Trying to free...")
+                )
+                rr.log(f"map/artificial_obstacles", rr.Points2D(positions=rotate_frame(self.artificial_obstacles), colors=[[0,0,0]], radii=[0.5]))
+
+    def _build_similarity_mask(self, kernel_size=7):
+        adjusted_score = self.one_map.similarity_map + 1.0
         similarity_threshold = np.percentile(adjusted_score[self.one_map.confidence_map > 0], self.percentile_exploitation)
         similarity_mask = (adjusted_score > similarity_threshold).astype(np.uint8)
 
@@ -494,8 +376,28 @@ class Navigator:
         
         return cv2.dilate(similarity_mask, k, iterations=1)
 
+    def _convert_to_map_coordinates(self,depth:np.ndarray, odometry:np.ndarray, masks:np.ndarray)->Tuple[int,int,np.ndarray]:
+        # Pixels representing the detected object on the image
+        object_coords = np.argwhere(masks[0] & (depth != 0))
+        yaw = np.arctan2(odometry[1, 0], odometry[0, 0])
+
+        object_depths = depth[object_coords[:, 0], object_coords[:, 1]]
+
+        y_world = -(object_coords[:, 1] - self.projection.fx_fy_cx_cy[2]) * object_depths / self.projection.fx_fy_cx_cy[0]
+        x_world = object_depths
+        r = np.array([[np.cos(yaw), -np.sin(yaw)],
+                        [np.sin(yaw), np.cos(yaw)]])
+        x_rot, y_rot = np.dot(r, np.stack((x_world, y_world)))
+        x_rot += odometry[0, 3]
+        y_rot += odometry[1, 3]
+
+        x_id = (x_rot / self.one_map.cell_size).astype(np.uint32) + self.projection.map_center_cells[0].item()
+        y_id = (y_rot / self.one_map.cell_size).astype(np.uint32) + self.projection.map_center_cells[1].item()
+
+        return x_id, y_id, object_depths
+
     def _consensus_filtering(self, adjusted_score, depths, x_id, y_id):
-        similarity_mask = self._build_similarity_mask(adjusted_score)
+        similarity_mask = self._build_similarity_mask()
 
         similarity_mask_projections = similarity_mask[x_id, y_id]
         if not np.any(similarity_mask_projections):
@@ -513,47 +415,14 @@ class Navigator:
         self.chosen_detection = closest_object_point
         return True
 
-    def add_data(self, image: np.ndarray, depth: np.ndarray, odometry: np.ndarray,) -> bool:
-        """
-        Adds data to the navigator
-        :param image: RGB image of dimension [C, H, W]
-        :param depth: depth image of dimension [H, W]
-        :param odometry: 4x4 transformation matrix from camera to world
-        :return: boolean indicating if the episode is over
-        """
-        if not self.one_map.camera_initialized:
-            raise RuntimeError("Camera matrix not set, please set camera matrix first")
-        
-        t0 = time.time()
-        odometry = odometry.astype(np.float32)
-        x = odometry[0, 3]
-        y = odometry[1, 3]
-        yaw = np.arctan2(odometry[1, 0], odometry[0, 0])
-
-        px, py = self.one_map.metric_to_px(x, y)
-
-        self._free_stuck_agent(px, py, yaw)
-
+    def check_object_in_image(self, image: np.ndarray, depth: np.ndarray, odometry: np.ndarray)->bool:
+        # Case: the queried object was detected in the current image
         detections = self.detector.detect(image.transpose(1, 2, 0))
-        image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
-        self.one_map.update(image_features, depth, odometry, self.artificial_obstacles)
-        self.update_map()
-
-        current_pos = np.array([px, py])
-        old_path = self.path.copy() if self.path else self.path
-        old_id = self.path_id
-        if self.first_obs:
-            self.one_map.confidence_map[px - 10:px + 10, py - 10:py + 10] += 10
-            self.one_map.checked_conf_map[px - 10:px + 10, py - 10:py + 10] += 10
-            self.first_obs = False
-
-        self.saw_left = False
-        self.saw_right = False
         if len(detections["boxes"]) > 0:
             # wants rgb
             self.sam_predictor.set_image(image.transpose(1, 2, 0))
             for area, confidence in zip(detections["boxes"], detections['scores']):
-                if self.log:
+                if self.config.log_rerun:
                     rr.log(
                         f"agent_{self.agent_id}/camera/detection", 
                         rr.Boxes2D(
@@ -564,107 +433,112 @@ class Navigator:
                     )
                     rr.log("object_detections", rr.TextLog(f"Object {self.query_text[0]} detected"))
 
-                # TODO Find free point in front of object
-                area_center = (int((area[3] + area[1]) // 2), int((area[2] + area[0]) // 2))
-                masks, _, _ = self.sam_predictor.predict(
+                # Obtain the object masks.
+                masks, *_ = self.sam_predictor.predict(
                     point_coords=None,                                     
                     point_labels=None,
                     box=np.array(area)[None, :],
                     multimask_output=False, 
                 )
-                # Project the points where the mask is one
-                mask_ids = np.argwhere(masks[0] & (depth != 0))
-                depth_detection = depth[area_center[0], area_center[1]]
 
-                depths = depth[mask_ids[:, 0], mask_ids[:, 1]]
+                dist_to_obj_center = depth[(int((area[3] + area[1]) // 2), int((area[2] + area[0]) // 2))]
+                if not self.config.planner.filter_detections_depth or dist_to_obj_center < 2.5:
+                    x_id, y_id, object_depths = self._convert_to_map_coordinates(depth, odometry, masks)
 
-                if not self.filter_detections_depth or depth_detection < 2.5:
-                    y_world = -(mask_ids[:, 1] - self.one_map.cx) * depths / self.one_map.fx
-                    x_world = depths
-                    r = np.array([[np.cos(yaw), -np.sin(yaw)],
-                                  [np.sin(yaw), np.cos(yaw)]])
-                    x_rot, y_rot = np.dot(r, np.stack((x_world, y_world)))
-                    x_rot += odometry[0, 3]
-                    y_rot += odometry[1, 3]
-
-                    x_id = ((x_rot / self.one_map.cell_size)).astype(np.uint32) + \
-                           self.one_map.map_center_cells[0].item()
-                    y_id = ((y_rot / self.one_map.cell_size)).astype(np.uint32) + \
-                           self.one_map.map_center_cells[1].item()
-
-                    adjusted_score = self.one_map.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
-                    if self.log:
-                        rr.log(f"map/agent_{self.agent_id}/proj_detect",
-                               rr.Points2D(np.stack((y_id, x_id)).T, colors=[[0, 0, 255]], radii=[1]))
-                        # log the segmentation mask as rgba
+                    adjusted_score = self.one_map.similarity_map + 1.0  # only positive scores
+                    if self.config.log_rerun:
+                        rr.log(
+                            f"map/agent_{self.agent_id}/proj_detect",
+                            rr.Points2D(np.stack((y_id, x_id)).T, colors=[[0, 0, 255]], radii=[1])
+                        )
                         rr.log(f"agent_{self.agent_id}/camera/mask", rr.SegmentationImage(masks[0].astype(np.uint8)))
 
-                    if self.consensus_filtering:
-                        object_valid = self._consensus_filtering(adjusted_score, depths, x_id, y_id)
+                    # Check whether the detected object is valid
+                    if self.config.planner.consensus_filtering:
+                        object_valid = self._consensus_filtering(adjusted_score, object_depths, x_id, y_id)
 
                     else:
-                        closest_object_point = (x_id[np.argmin(depths)], y_id[np.argmin(depths)])
+                        closest_object_point = (x_id[np.argmin(object_depths)], y_id[np.argmin(object_depths)])
                         if self.object_detected and adjusted_score[closest_object_point] < adjusted_score[self.chosen_detection] * 1.1:
                             object_valid = False
                         else:
                             self.chosen_detection = closest_object_point
                             object_valid = True
 
-
                     if object_valid:
-                        self.object_detected = True
-                        self.compute_best_path(current_pos)
+                        old_path = self.path.copy() if self.path else self.path
+                        px, py = self.projection.metric_to_px(odometry[0, 3], odometry[1, 3])
+                        self.object_detected = self.compute_best_path_to_object(np.array([px, py]))
                         if not self.path:
-                            self.object_detected = False
                             self.path = old_path
-                            self.path_id = old_id
                         else:
-                            if self.log:
-                                rr.log("path_updates",
-                                       rr.TextLog(f"The object {self.query_text[0]} has been detected just now."))
-                                rr.log(f"map/agent_{self.agent_id}/goal_pos",
-                                       rr.Points2D(rotate_frame([self.chosen_detection]), colors=[self.agent_color], radii=[3]))
+                            if self.config.log_rerun:
+                                rr.log("path_updates",rr.TextLog(f"The object {self.query_text[0]} has been detected just now."))
+                                rr.log(
+                                    f"map/agent_{self.agent_id}/goal_pos",
+                                    rr.Points2D(
+                                        rotate_frame([self.chosen_detection]), 
+                                        colors=[self.agent_color], 
+                                        radii=[3]
+                                    )
+                                )
         else:
-            if self.log:
+            if self.config.log_rerun:
                 rr.log(f"agent_{self.agent_id}/camera/detection", rr.Clear(recursive=True))
                 rr.log(f"map/agent_{self.agent_id}/proj_detect", rr.Clear(recursive=True))
             if not self.object_detected:
                 self.chosen_detection = None
-
-        if not self.object_detected:
-            if self.saw_left:
-                self.cyclic_detect_checker.add_state_action(np.array([px, py]), "L")
-            elif self.saw_right:
-                self.cyclic_detect_checker.add_state_action(np.array([px, py]), "R")
-        self.compute_frontiers_and_POIs(*self.one_map.metric_to_px(odometry[0, 3], odometry[1, 3]))
-        if self.log:
-            adjusted_score = self.one_map.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
-            similarity_mask = self._build_similarity_mask(adjusted_score, kernel_size=3)
-            log_map_rerun(similarity_mask, path="map/similarity_th")
-
-        # Compute the new path
-        # TODO Make the thresholds and distances to object a parameter
-        if self.object_detected:
-            if np.linalg.norm(current_pos - self.chosen_detection) <= self.max_detect_distance:
-                self.object_detected = False
-                return True
-            if self.consensus_filtering and self.object_detected:
-                adjusted_score = self.one_map.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
-                similarity_mask = self._build_similarity_mask(adjusted_score)
-
-                if not similarity_mask[self.chosen_detection[0], self.chosen_detection[1]]:
-                    self.object_detected = False
-                    rr.log("path_updates", rr.TextLog("Current path lost similarity."))
-        if self.allow_replan:
-            self.compute_best_path(current_pos)
         
+        return self.object_detected
+
+    def check_object_reached(self, current_pos):
+        # We are following an object we detected at previous iterations (or just now)
+        if np.linalg.norm(current_pos - self.chosen_detection) <= self.max_detect_distance:
+            self.object_detected = False
+            return self.agent_id
+
+        if self.config.planner.consensus_filtering:
+            similarity_mask = self._build_similarity_mask()
+
+            if not similarity_mask[tuple(self.chosen_detection)]:
+                self.object_detected = False
+                if self.config.log_rerun:    
+                    rr.log("path_updates", rr.TextLog("Current path lost similarity."))
+                return -1
+    
+        if self.config.planner.allow_replan:
+            self.object_detected = self.compute_best_path_to_object(current_pos)            
+
         if self.object_detected and len(self.path) < 3:
             self.object_detected = False
-            return True
-        self.last_pose = (px, py, yaw)
+            return self.agent_id
 
-        # if time.time() - t0 > 4:
-        #     raise RuntimeError()
+        return -1
+
+    def add_data(self, image: np.ndarray, depth: np.ndarray, odometry: np.ndarray,):
+        """
+        Adds data to the navigator
+        :param image: RGB image of dimension [C, H, W]
+        :param depth: depth image of dimension [H, W]
+        :param odometry: 4x4 transformation matrix from camera to world
+        :return: boolean indicating if the episode is over
+        """
+        
+        yaw = np.arctan2(odometry[1, 0], odometry[0, 0])
+        px, py = self.projection.metric_to_px(odometry[0, 3], odometry[1, 3])
+
+        self._free_stuck_agent(px, py, yaw)
+
+        # Update onemap with new information
+        image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
+        self.one_map.update(self.projection, image_features, depth, odometry, self.artificial_obstacles)
+        self.update_map()
+
+        # Ensure proper start of the agent. It will not try to look at its feet.
+        if self.first_obs:
+            self.one_map.confidence_map[px - 10:px + 10, py - 10:py + 10] += 10
+            self.one_map.checked_conf_map[px - 10:px + 10, py - 10:py + 10] += 10
+            self.first_obs = False
 
     def update_map(self, reset=False) -> None:
         """updates the similarity map given the query text"""
@@ -678,14 +552,14 @@ class Navigator:
         if mask.max() == 0:
             return
         
-        if self.one_map.previous_sims is not None:
+        if self.one_map.similarity_map is not None:
             map_features = self.one_map.feature_map[mask, :].permute(1, 0).unsqueeze(0)
         else:
             map_features = self.one_map.feature_map.permute(2, 0, 1).unsqueeze(0)
 
-        similarity = self.model.compute_similarity(map_features, self.query_text_features)
+        similarity = self.model.compute_similarity(map_features, self.query_text_features)[0].cpu().numpy()
 
-        if self.one_map.previous_sims is None:
+        if self.one_map.similarity_map is None:
             self.one_map.set_similarity_map(similarity)
         else:
             # then, similarity is only updated where the mask is true, otherwise it is the previous similarity
@@ -693,45 +567,4 @@ class Navigator:
         self.one_map.reset_updated_mask()
         
 if __name__ == "__main__":
-    from vision_models.clip_dense import ClipModel
-    # from vision_models.yolov7_model import YOLOv7Detector
-    from vision_models.trt_yolo_world_detector import TRTYOLOWorldDetector
-    import matplotlib.pyplot as plt
-    import cv2
-
-    # Yolo World
-    # from ultralytics import YOLOWorld, YOLO
-
-    # yw_detector = YOLO("yolov8s-worldv2.engine")
-
-    print("Am I doing this?")
-
-    camera_matrix = np.array([[384.41534423828125, 0.0, 328.7698059082031],
-                              [0.0, 384.0389404296875, 245.87942504882812],
-                              [0.0, 0.0, 1.0]])
-    rgb = cv2.imread("/home/spot/Finn/MON/test_images/pairs/rgb_1.png")
-    rgb = rgb[:, :, ::-1]
-    rgb = cv2.resize(rgb, (640, 480)).transpose(2, 0, 1)
-    depth = cv2.imread("/home/spot/Finn/MON/test_images/pairs/depth_1.png")
-    depth = depth.astype(np.float32) / 255.0 * 3.0
-    depth = cv2.resize(depth, (640, 480))[:, :, 0]
-    odom = np.eye(4)
-    # entire forward pass test
-    base_conf = load_config()
-    mapper = Navigator(ClipModel("", True), TRTYOLOWorldDetector(base_conf.Conf.planner.yolo_confidence), base_conf.Conf)
-    mapper.set_camera_matrix(camera_matrix)
-    mapper.set_query(["A fridge"])
-    mapper.add_data(rgb, depth, odom)
-    # test image, depth, odometry
-    a = time.time()
-    for i in range(10):
-        mapper.add_data(rgb, depth, odom)
-        # yw_detections = yw_detector(rgb.transpose(1, 2, 0))
-        # yw_detections[0].show()
-
-    print(f"Entire map update: {(time.time() - a) / 10}")
-    mapper.update_map()
-    sims = mapper.one_map.get_similarity_map()
-    plt.imshow(sims[0])
-    plt.savefig("firstmap.png")
-    plt.show()
+    pass
