@@ -57,9 +57,6 @@ class Cluster(NavGoal):
         # score is the max score in the cluster
         self.cluster_score = np.max(score_map[self.points[:, 0], self.points[:, 1]])
 
-    def compute_explore_score(self, confidence_map:np.ndarray):
-        self.cluster_explore_score = 1 / (np.median(confidence_map[self.points[:, 0], self.points[:, 1]]) + 1e-7)
-
 # Include the previous clustering functions here
 def find_local_maxima(similarity_map, mask, neighborhood_size=10):
     local_max = maximum_filter(similarity_map, size=neighborhood_size)

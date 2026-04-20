@@ -62,8 +62,9 @@ class Metrics:
         self.sequence_agent_finding:list[int] = []
         self.sequence_poses:list[list[np.ndarray]] = []
         self.sequence_object:list[str] = []
+        self.sequence_map_size:list[list[int]] = []
 
-    def add_sequence(self, sequences: list, result: Result, agent_id:int, target_object: str) -> None:
+    def add_sequence(self, sequences: list, map_size:list, result: Result, agent_id:int, target_object: str) -> None:
         start_id = 0
         if len(self.sequence_poses) > 0:
             start_id = sum([len(seq[0]) for seq in self.sequence_poses])
@@ -72,6 +73,7 @@ class Metrics:
         self.sequence_results.append(result)
         self.sequence_agent_finding.append(agent_id)
         self.sequence_object.append(target_object)
+        self.sequence_map_size.append(map_size)
 
     def get_progress(self):
         return self.sequence_results.count(Result.SUCCESS) /SEQ_LEN
@@ -264,11 +266,11 @@ class HabitatMultiEvaluator:
         if self.log_rerun:
             rr.log("map/ground_truth", rr.Points2D(rotate_frame(pts), colors=[[255, 255, 255]], radii=[1]))
 
-    def evaluate(self, from_scratch=True):
+    def evaluate(self, from_scratch=False):
         results:list[Metrics] = []
         agents_ids = list(range(self.n_agents))
 
-        starting_point = 214 if from_scratch else len(os.listdir(os.path.join(self.results_path, "state")))
+        starting_point = 0 if from_scratch else len(os.listdir(os.path.join(self.results_path, "state")))
 
         for n_ep, episode in enumerate(self.episodes[starting_point:]):
             poses = [[] for _ in agents_ids]
@@ -286,6 +288,7 @@ class HabitatMultiEvaluator:
             sequence_id = 0
             failed = False
             while not failed and sequence_id < len(episode.obj_sequence):
+                explored_map_size = []
                 current_obj = episode.obj_sequence[sequence_id]
                 self.actor.set_query(current_obj)
 
@@ -312,6 +315,11 @@ class HabitatMultiEvaluator:
 
                     if self.log_rerun:
                         self.logger.log_map()
+                        rr.log("step", rr.TextLog(steps))
+                        rr.log("path_updates", rr.TextLog(steps))
+                    
+                    if steps % 10 == 0:
+                        explored_map_size.append(self.actor.one_map.fully_explored_map.sum())
 
                     if steps % 100 == 0:
                         dists = [get_closest_dist(
@@ -324,29 +332,30 @@ class HabitatMultiEvaluator:
                     pbar.update(1)
 
                 if agent_called_found != -1:
-                    dists = [get_closest_dist(self.sim.get_agent(agent_id).get_state().position[[0, 2]],
-                                            self.scene_data[episode.scene_id].object_locations[current_obj],
-                                            self.is_gibson) for agent_id in agents_ids]
-                    if np.min(dists) < self.config.max_dist:
+                    dist = get_closest_dist(
+                        self.sim.get_agent(agent_called_found).get_state().position[[0, 2]],
+                        self.scene_data[episode.scene_id].object_locations[current_obj],
+                        self.is_gibson
+                    ) 
+                    if dist < self.config.max_dist:
                         result = Result.SUCCESS
                         pbar.write(f"Object {current_obj} found!")
                     else:
                         failed = True
-                        dists_detect = []
-                        for mapper in self.actor.mappers:
-                            pos = mapper.chosen_detection
-                            if pos is not None:
-                                pos_metric = self._px_to_metric(pos[0], pos[1])
-                                dists_detect.append(get_closest_dist(
-                                    [-pos_metric[1], -pos_metric[0]],
-                                    self.scene_data[episode.scene_id].object_locations[current_obj],
-                                    self.is_gibson
-                                ))
-                        if np.min(dists_detect) < self.config.max_dist:
+                        dist_detect = np.inf
+                        pos = self.actor.mappers[agent_called_found].chosen_detection
+                        if pos is not None:
+                            pos_metric = self._px_to_metric(pos[0], pos[1])
+                            dist_detect = get_closest_dist(
+                                [-pos_metric[1], -pos_metric[0]],
+                                self.scene_data[episode.scene_id].object_locations[current_obj],
+                                self.is_gibson
+                            )
+                        if dist_detect < self.config.max_dist:
                             result = Result.FAILURE_NOT_REACHED
                         else:
                             result = Result.FAILURE_MISDETECT
-                        pbar.write(f"Object {current_obj} not found! Dist {np.min(dists)}, detect dist: {np.min(dists_detect)}.")
+                        pbar.write(f"Object {current_obj} not found! Dist {dist}, detect dist: {dist_detect}.")
                     
                 else:
                     failed = True
@@ -360,11 +369,14 @@ class HabitatMultiEvaluator:
                     
                     pbar.write(f"Out of time to find object {current_obj}!")
 
-                results[-1].add_sequence(poses, result, agent_called_found, current_obj)
+                results[-1].add_sequence(poses, explored_map_size, result, agent_called_found, current_obj)
 
                 self.save_final_sims(episode.episode_id, sequence_id, poses)
 
                 sequence_id += 1
+
+            for seq_id, seq in enumerate(results[n_ep].sequence_map_size):
+                np.savetxt(f"{self.results_path}/trajectories/map_size_{episode.episode_id}_{seq_id}.csv", seq, delimiter=",")
 
             for seq_id, seq in enumerate(results[n_ep].sequence_poses):
                 for agent_id, agent_seq in enumerate(seq):

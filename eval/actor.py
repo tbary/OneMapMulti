@@ -6,6 +6,8 @@ from typing import Dict, Tuple
 import numpy as np
 from collections import defaultdict
 
+from config import EvalConf
+
 # MON
 from vision_models.clip_dense import ClipModel
 from vision_models.yolo_world_detector import YOLOWorldDetector
@@ -15,7 +17,7 @@ from vision_models.yolo_world_detector import YOLOWorldDetector
 # from vision_models.yolov6_model import YOLOV6Detector
 from vision_models.yolov7_model import YOLOv7Detector
 
-from mapping import Navigator, OneMap, Projection, rotate_frame
+from mapping import Navigator, OneMap, Projection, rotate_frame, Frontier
 from planning import Planning, Controllers
 # scipy
 from scipy.spatial.transform import Rotation as R
@@ -69,10 +71,13 @@ class Actor(ABC):
 class MONActor(Actor):
     one_map: OneMap
     mappers: list[Navigator]
-    def __init__(self, config):
+    def __init__(self, config:EvalConf):
         model = ClipModel("weights/clip.pth", jetson=False)
         detector = YOLOWorldDetector(config.planner.yolo_confidence) if config.planner.using_ov \
             else YOLOv7Detector(config.planner.yolo_confidence)
+
+        self.mode = config.mode
+        self.fallback_mode = config.fallback_mode
 
         self.n_agents = config.n_agents
         self.init = 36*2 * config.n_agents
@@ -88,36 +93,37 @@ class MONActor(Actor):
 
     # consider that obs has the obs for all the agents
     def act(self, observations: Dict[str, any]) -> Tuple[Dict, bool]:
+        odometries = [_transformation_matrix(observations[a]["state"])[1].astype(np.float32) for a in range(self.n_agents)]
+        current_poses = [np.array(self.projection.metric_to_px(odom[0, 3], odom[1, 3]), dtype=int) for odom in odometries]
+        yaws = [np.arctan2(odom[1, 0], odom[0, 0]) for odom in odometries]
+
         # Observe
-        obj_detected = np.zeros(len(self.mappers), dtype=bool)
         for a, mapper in enumerate(self.mappers):
             image = observations[a]["rgb"][..., :-1].transpose(2, 0, 1)
             depth = observations[a]["depth"].astype(np.float32)
-            odometry = _transformation_matrix(observations[a]["state"])[1].astype(np.float32)
 
-            yaw = np.arctan2(odometry[1, 0], odometry[0, 0])
-            current_pos = np.array(self.projection.metric_to_px(odometry[0, 3], odometry[1, 3]), dtype=int)
-            mapper.one_map.update_agent_pose((*current_pos,yaw), mapper.agent_id)
-            mapper.add_data(image, depth, odometry)
-            obj_detected[a] = mapper.check_object_in_image(image, depth, odometry)
-        nav_goals = self.one_map.compute_frontiers_and_POIs()
-        assigned_nav_goals = self.one_map.split_frontiers_and_POIs(obj_detected, nav_goals)
+            mapper.one_map.update_agent_pose((*current_poses[a],yaws[a]), mapper.agent_id)
+            mapper.add_data(image, depth, odometries[a])
+            mapper.check_object_in_image(image, depth, odometries[a])
+
+        nav_goals = self.one_map.compute_frontiers_and_POIs(self.mode, self.fallback_mode)
+        following_previous = [self.mappers[a].try_previous_frontier(current_poses[a], nav_goals) for a in range(self.n_agents)]
+        exploiting_agents = self.one_map.assign_roles(current_poses, self.mappers, nav_goals, following_previous)
+        unavailable_agents = np.logical_or(exploiting_agents, following_previous)
+        assigned_nav_goals = self.one_map.split_frontiers_and_POIs(unavailable_agents, nav_goals)
 
         # Plan
         obj_found = -1
         for a, mapper in enumerate(self.mappers):
-            odometry = _transformation_matrix(observations[a]["state"])[1].astype(np.float32)
-            current_pos = np.array(self.projection.metric_to_px(odometry[0, 3], odometry[1, 3]), dtype=int)
 
             if self.init == 0:
                 if mapper.object_detected:
-                    obj_found = max(mapper.check_object_reached(current_pos), obj_found)
+                    obj_found = max(mapper.check_object_reached(current_poses[a]), obj_found) #TODO, could be more technically correct
 
-                elif mapper.config.planner.allow_replan and len(assigned_nav_goals[a]):
-                    mapper.compute_best_path_to_frontier(current_pos, assigned_nav_goals[a])
+                elif mapper.config.planner.allow_replan and not unavailable_agents[a] and len(assigned_nav_goals[a]):
+                    mapper.compute_best_path_to_frontier(current_poses[a], assigned_nav_goals[a])
 
-            yaw = np.arctan2(odometry[1, 0], odometry[0, 0])
-            mapper.last_pose = (*current_pos, yaw)
+            mapper.last_pose = (*current_poses[a], yaws[a])
 
         # Act on plans
         return_act = defaultdict(lambda:defaultdict(dict))
@@ -134,7 +140,7 @@ class MONActor(Actor):
                     path = np.array(path).astype(np.float32)
                     rr.log(f"map/agent_{a}/path_simplified",  rr.LineStrips2D(
                         rotate_frame(path), 
-                        colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
+                        colors=np.repeat(np.array(mapper.agent_color)[np.newaxis, :],
                         path.shape[0], axis=0)
                     ))
                     for i in range(path.shape[0]):

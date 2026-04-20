@@ -21,6 +21,7 @@ from mobile_sam import sam_model_registry, SamPredictor
 
 # numpy
 import numpy as np
+import matplotlib.pyplot as plt
 
 # typing
 from typing import List, Optional, Set, Any, Union, Tuple
@@ -101,7 +102,8 @@ class Navigator:
         self.cyclic_checker = CyclicChecker()
         self.config = config
         self.agent_id = agent_id
-        self.agent_color = [[255,0,0],[0,255,0],[0,0,255]][agent_id]
+        self.agent_color = [(int(r*255), int(g*255), int(b*255)) for r,g,b in plt.get_cmap('tab10').colors[agent_id:agent_id+1]]
+        self.role: str["exploiter", "explorer", "idle"] = "idle"
 
         # Models
         self.model = model
@@ -128,7 +130,6 @@ class Navigator:
         self.similar_scores = None
         self.object_detected = False
         self.chosen_detection = None
-        self.navigation_scores = np.zeros_like(self.one_map.navigable_map, dtype=np.float32)
         self.path = None
         self.initializing = True
         self.stuck_at_nav_goal_counter = 0
@@ -163,13 +164,13 @@ class Navigator:
         self.last_pose = None
         self.stuck_at_nav_goal_counter = 0
         self.stuck_at_cell_counter = 0
-        self.navigation_scores = np.zeros_like(self.one_map.navigable_map, dtype=np.float32)
         self.path = None
         self.initializing = True
         self.one_map.reset()
         self.first_obs = True
         self.cyclic_checker = CyclicChecker()
         self.artificial_obstacles = set()
+        self.role = "idle"
 
     def set_query(self, txt: List[str]) -> None:
         """
@@ -207,14 +208,6 @@ class Navigator:
 
         if self.path and len(self.path) > 0:
             if self.config.log_rerun:
-                rr.log(
-                    f"map/agent_{self.agent_id}/path", 
-                    rr.LineStrips2D(
-                        rotate_frame(self.path), 
-                        colors=np.repeat(np.array([0, 255, 0])[np.newaxis, :],
-                        len(self.path), axis=0)
-                    )
-                )
                 rr.log("path_updates",rr.TextLog(f"Path to object {self.query_text[0]} of length {len(self.path)} computed."))
             return True
         
@@ -224,7 +217,7 @@ class Navigator:
             return False
 
     def _check_previous_frontier(self, assigned_nav_goals: List[NavGoal]):
-        if self.last_nav_goal is None:
+        if self.last_nav_goal is None or not len(assigned_nav_goals):
             return None, None
         
         last_point = self.last_nav_goal.get_descr_point()
@@ -247,6 +240,10 @@ class Navigator:
                 return None, None
             
             current_index = closest_index
+        
+        if self.role == "explorer":
+            if assigned_nav_goals[current_index].get_explore_score() > 0:
+                return current_index, assigned_nav_goals[current_index]
 
         current_score = assigned_nav_goals[current_index].get_score()
         previous_score = self.last_nav_goal.get_score()
@@ -257,13 +254,41 @@ class Navigator:
 
         return None, None
 
+    def try_previous_frontier(self, start:np.ndarray, nav_goals:List[NavGoal])->bool:
+        if self.object_detected:
+            return False
+        
+        nav_id, goal = self._check_previous_frontier(nav_goals)
+
+        if nav_id is None:
+            return False
+
+        min_goal_dist = 2 if isinstance(goal, Frontier) else 4
+        self.path = Planning.compute_to_goal(
+            start, 
+            self.one_map.navigable_map & (self.one_map.confidence_map > 0).cpu().numpy(),
+            (self.one_map.confidence_map > 0).cpu().numpy(),
+            goal.get_descr_point(),
+            self.obstcl_kernel_size, 
+            min_goal_dist
+        )
+
+        if self.path is None:
+            return False
+        
+        self._free_unattainable_goal_agent(start, goal)
+        
+        if self.config.log_rerun:
+            rr.log("path_updates", rr.TextLog(f"Agent {self.agent_id} ({self.role} - from try_previous): computed path of length {len(self.path)}"))
+            rr.log(
+                f"map/agent_{self.agent_id}/frontiers_dispatch",
+                rr.Points2D(rotate_frame([goal.get_descr_point()]), colors=self.agent_color,radii=[1])
+            )
+
+        nav_goals.pop(nav_id)
+        return True
+
     def _get_current_nav_goal(self, start, assigned_nav_goals:List[NavGoal])->Tuple[int, Union[Frontier, Cluster]]:
-        # We have a frontier and we need to consider following up on that
-        nav_id, goal = self._check_previous_frontier(assigned_nav_goals)
-
-        if nav_id is not None:
-            return nav_id, goal
-
         second_idx = 0 if len(assigned_nav_goals) == 1 else 1
         top_two_vals = tuple((assigned_nav_goals[0].get_score(), assigned_nav_goals[second_idx].get_score()))
                
@@ -273,7 +298,7 @@ class Navigator:
             if not self.cyclic_checker.check_cyclic(start, goal.get_descr_point(), top_two_vals):
                 self.cyclic_checker.add_state_action(start, goal.get_descr_point(), top_two_vals)
                 return nav_id, goal
-
+            
     def compute_best_path_to_frontier(self, start: np.ndarray, assigned_nav_goals:List[NavGoal]):
         self.path = None
         while self.path is None and len(assigned_nav_goals) > 0:
@@ -305,14 +330,7 @@ class Navigator:
             similarity_mask = self._build_similarity_mask(kernel_size=3)
             log_map_rerun(similarity_mask, path="map/similarity_th")
             if self.path:
-                rr.log("path_updates", rr.TextLog(f"Agent {self.agent_id}: computed path of length {len(self.path)}"))
-                rr.log(f"map/agent_{self.agent_id}/path", 
-                    rr.LineStrips2D(
-                        rotate_frame(self.path), 
-                        colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
-                        len(self.path), axis=0)
-                    )
-                )
+                rr.log("path_updates", rr.TextLog(f"Agent {self.agent_id} ({self.role} - from compute_best): computed path of length {len(self.path)}"))
                 pts = np.array([nav_goal.get_descr_point() for nav_goal in assigned_nav_goals])
                 rr.log(
                     f"map/agent_{self.agent_id}/frontiers_dispatch",
@@ -474,14 +492,7 @@ class Navigator:
                         else:
                             if self.config.log_rerun:
                                 rr.log("path_updates",rr.TextLog(f"The object {self.query_text[0]} has been detected just now."))
-                                rr.log(
-                                    f"map/agent_{self.agent_id}/goal_pos",
-                                    rr.Points2D(
-                                        rotate_frame([self.chosen_detection]), 
-                                        colors=[self.agent_color], 
-                                        radii=[3]
-                                    )
-                                )
+
         else:
             if self.config.log_rerun:
                 rr.log(f"agent_{self.agent_id}/camera/detection", rr.Clear(recursive=True))

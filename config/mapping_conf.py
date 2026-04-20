@@ -25,4 +25,3 @@ class MappingConf:
     filter_stairs: bool
     floor_level: float
     floor_threshold: float
-

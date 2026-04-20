@@ -10,7 +10,7 @@ from .projection import Projection
 
 from config import MappingConf
 from planning import Planning
-from onemap_utils import monochannel_to_inferno_rgb, log_map_rerun, log_dino_embeddings_tsne
+from onemap_utils import monochannel_to_inferno_rgb, log_map_rerun
 
 
 from skimage.measure import label
@@ -24,7 +24,10 @@ import numpy as np
 import scipy.optimize
 
 # typing
-from typing import Tuple, List, Optional, Union, Set, Dict
+from typing import Tuple, List, Optional, Union, Set, Dict, Literal, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .navigator import Navigator
 
 # rerun
 import rerun as rr
@@ -257,14 +260,13 @@ class OneMap:
             self.similarity_map[mask] = similarity_map
         else:
             self.similarity_map = similarity_map
-
-    def set_frontiers_exploration_score(self, frontiers:List[Frontier]):
+    
+    def _attach_discovery_to_frontier(self, frontiers:List[Frontier]):
         discovery_map = self.navigable_map.copy()
         discovery_map[self.confidence_map.cpu().numpy()==0] = False
         discovery_map[self.fully_explored_map] = False
         
         connected_components = label(discovery_map)
-        connected_components_sizes = np.bincount(connected_components.flatten())
 
         distances, indices = distance_transform_edt(
             connected_components == 0,        # background mask
@@ -276,45 +278,104 @@ class OneMap:
                 distance_to_nearest_comp = distances[tuple(fc)]
                 if distance_to_nearest_comp <= 1:
                     nearest_comp_label = connected_components[tuple(indices[...,fc[0], fc[1]])]
-                    frontier.frontier_explore_score = connected_components_sizes[nearest_comp_label]
-                    break
+                    frontier.discovery_zone.extend(list(np.argwhere(connected_components == nearest_comp_label)))
+            frontier.discovery_zone = np.unique(frontier.discovery_zone, axis=0)
+                
         if self.config.log_rerun:
+            import matplotlib.pyplot as plt
+            frontier_colors = [(int(r*255), int(g*255), int(b*255)) for r,g,b in plt.get_cmap('tab20').colors]
+            disc_zones = []
+            colors = []
+            for f, frontier in enumerate(frontiers):
+                disc_zones.extend(frontier.discovery_zone)
+                colors.extend([frontier_colors[f]]*len(frontier.discovery_zone))
+            rr.log("map/zones", rr.Points2D(rotate_frame(disc_zones), colors=colors, radii=[0.5]*len(disc_zones)))
             log_map_rerun(discovery_map, path="map/discovery")
 
-    def compare_diversity(self, feature_map:np.ndarray, explored_mask:np.ndarray, nav_goal_coords:List[np.ndarray], max_components:int =5, display: bool=False):
-        import time
-        t1 = time.time()
-        # from sklearn.mixture import GaussianMixture
-        # from sklearn.neighbors import KernelDensity
-        # from sklearn.decomposition import PCA
+    def set_exploration_scores(self, nav_goals:List[NavGoal], mode:Literal["size", "dist", "diversity", "certainty", "greedy"]="greedy", fallback:Literal["certainty", "greedy"]="greedy"):
+        frontiers = [ng for ng in nav_goals if isinstance(ng, Frontier)]
+        clusters = [ng for ng in nav_goals if isinstance(ng, Cluster)]
 
-        # explored_map_features = feature_map[explored_mask & (feature_map.sum(axis=-1) != 0.0)]
-        # nav_goal_features = [feature_map[ngc[:, 0], ngc[:, 1]] for ngc in nav_goal_coords]
+        self._attach_discovery_to_frontier(frontiers)
 
-        # # print(nav_goal_coords.shape, nav_goal_features.shape, explored_map_features.shape)
-        # if display:
-        #     log_dino_embeddings_tsne([explored_map_features, *nav_goal_features], perplexity=min(len(explored_map_features)-5,30))
-
-        # # pca = PCA(n_components=np.min((50, *explored_map_features.shape)), svd_solver='randomized', random_state=42)
-        # # emf_reduced = pca.fit_transform(explored_map_features)
+        if mode == "size":
+            for frontier in frontiers:
+                frontier.frontier_explore_score = len(frontier.discovery_zone)
+            for cluster in clusters:
+                cluster.cluster_explore_score = 0
         
-        # nav_goal_scores = np.empty(len(nav_goal_features))
-        # k = int(np.ceil(0.001*len(explored_map_features)))
-        # for i, ngf in enumerate(nav_goal_features):
-        #     cosine_similarities = np.matmul(explored_map_features, ngf.T)
-        #     point_proximity_scores = np.mean(np.sort(cosine_similarities, axis=0)[-k:], axis=0)
+        elif mode == "dist":
+            raise NotImplementedError("dist is not implemented yet...")
+            for cluster in clusters:
+                cluster.cluster_explore_score = 0
+        
+        # if np.random.randint(0,100) == 50:
+        #     arrays = []
+        #     feature_map_array = self.feature_map.cpu().numpy()
+        #     explored_map_features = feature_map_array[self.fully_explored_map & (feature_map_array.sum(axis=-1) != 0.0)]
+        #     for frontier in frontiers:
+        #         points = frontier.discovery_zone
+        #         if not len(points):
+        #             frontier.frontier_explore_score = 0
+        #         else:
+        #             frontier_features = feature_map_array[points[:, 0], points[:, 1]]
+        #             dissim = 1-np.matmul(explored_map_features, frontier_features.T)
 
-        #     threshold = np.quantile(point_proximity_scores, 0.5)
-        #     filt_point_proximity_scores = point_proximity_scores[point_proximity_scores <= threshold]
-        #     nav_goal_scores[i] = np.mean(filt_point_proximity_scores)
+        #             dissim_per_frontier_point = np.min(dissim, axis=0)
+        #             arrays.append(dissim_per_frontier_point)
 
-        # candidate = np.argmin(nav_goal_scores)
-        # pts = nav_goal_coords[candidate]
-        # rr.log("map/candidate", rr.Points2D(rotate_frame(pts), colors=[[255,255,0]]*pts.shape[0], radii=[1]*pts.shape[0]))
-        # print(time.time() - t1)
-        # raise ValueError
+        #     import uuid
+        #     # Generate random filename
+        #     filename = f"results_multi_one/{uuid.uuid4().hex}.npy"
 
-    def compute_frontiers_and_POIs(self, allow_retry=True):
+        #     # Save to file
+        #     np.save(filename, np.array(arrays, dtype=object), allow_pickle=True)           
+
+        elif mode == "diversity":
+            feature_map_array = self.feature_map.cpu().numpy()
+            explored_map_features = feature_map_array[self.fully_explored_map & (feature_map_array.sum(axis=-1) != 0.0)]
+            for frontier in frontiers:
+                points = frontier.discovery_zone
+                if not len(points):
+                    frontier.frontier_explore_score = 0
+                else:
+                    frontier_features = feature_map_array[points[:, 0], points[:, 1]]
+                    dissim = 1-np.matmul(explored_map_features, frontier_features.T)
+
+                    dissim_per_frontier_point = np.min(dissim, axis=0)
+                    
+                    frontier.frontier_explore_score = np.mean(np.sort(dissim_per_frontier_point)[-75:])
+
+            for cluster in clusters:
+                cluster.cluster_explore_score = 0
+               
+        if mode not in ["certainty", "greedy"] and (not len(frontiers) or np.all([frontier.frontier_explore_score == 0 for frontier in frontiers])):
+            mode = fallback
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(f"Fallback activated ({mode}). {len(frontiers)} frontiers."))
+
+        if mode == "certainty":
+            for frontier in frontiers:
+                points = frontier.discovery_zone
+                if not len(points):
+                    frontier.frontier_explore_score = 0
+                else:
+                    frontier.frontier_explore_score = 1 / (np.median(self.confidence_map[points[:, 0], points[:, 1]]) + 1e-7)
+            for cluster in clusters:
+                cluster.cluster_explore_score = 1 / (np.median(self.confidence_map[cluster.points[:, 0], cluster.points[:, 1]]) + 1e-7)
+        
+        elif mode == "greedy":
+            for frontier in frontiers:
+                frontier.frontier_explore_score = frontier.frontier_score
+            for cluster in clusters:
+                cluster.cluster_explore_score = cluster.cluster_score
+
+    def _cluster_reachable(self, cluster:Cluster, largest_contour, req_dist=-15):
+        in_fully_explored = self.fully_explored_map[tuple(cluster.center)]
+        close_to_reach = largest_contour is None or cv2.pointPolygonTest(largest_contour, cluster.center.astype(float), measureDist=True) > req_dist
+        return close_to_reach or in_fully_explored
+
+    def compute_frontiers_and_POIs(self, mode, fallback_mode, allow_retry=True):
         """
         Computes the frontiers (at the border from fully explored to confidence > 0),
         and points of interest (high similarity regions within the fully explored, but not checked map)
@@ -329,7 +390,6 @@ class OneMap:
         frontiers, unexplored_map, largest_contour = detect_frontiers(
             self.navigable_map.astype(np.uint8),
             self.fully_explored_map.astype(np.uint8),
-            self.confidence_map > 0,
             int(1.0 * ((self.config.n_points / self.config.size) ** 2))
         )
 
@@ -344,12 +404,8 @@ class OneMap:
         clusters = cluster_high_similarity_regions(normalized_map, (self.confidence_map > 0.0).cpu().numpy())
         for cluster in clusters:
             cluster.compute_score(adjusted_score)
-            if len(self.blacklisted_nav_goals) == 0 or not np.any(
-                    np.all(cluster.get_descr_point() == self.blacklisted_nav_goals, axis=1)):
-                if ((largest_contour is None or cv2.pointPolygonTest(largest_contour, cluster.center.astype(float),
-                                                                        measureDist=True) > -15.0) or
-                    self.fully_explored_map[cluster.center[0], cluster.center[1]]) and \
-                        (not self.checked_map[cluster.center[0], cluster.center[1]]):
+            if len(self.blacklisted_nav_goals) == 0 or not np.any(np.all(cluster.get_descr_point() == self.blacklisted_nav_goals, axis=1)):
+                if self._cluster_reachable(cluster, largest_contour) and not self.checked_map[tuple(cluster.center)]:
                     nav_goals.append(cluster)
         
         if self.config.log_rerun:
@@ -370,39 +426,117 @@ class OneMap:
                 self.frontier_depth)
             frontier_mp = np.round(frontier_mp)
             if len(self.blacklisted_nav_goals) == 0 or not np.any(np.all(frontier_mp == self.blacklisted_nav_goals, axis=1)):
-                frontier = Frontier(frontier_midpoint=frontier_mp, points=frontier_points, frontier_score=score, frontier_explore_score=0)
+                frontier = Frontier(frontier_midpoint=frontier_mp, points=frontier_points, frontier_score=score, frontier_explore_score=0, discovery_zone=[])
                 nav_goals.append(frontier)
+
+        self.set_exploration_scores(nav_goals, mode=mode, fallback=fallback_mode)
 
         if self.config.log_rerun:
             if len(nav_goals) > 0:
                 pts = np.array([nav_goal.get_descr_point() for nav_goal in nav_goals])
                 scores = np.array([nav_goal.get_score() for nav_goal in nav_goals])
-                rr.log("map/frontiers_and_POIs",
-                        rr.Points2D(rotate_frame(pts), colors=np.flip(monochannel_to_inferno_rgb(scores), axis=-1),
-                                    radii=[1] * pts.shape[0]))               
-
-        self.set_frontiers_exploration_score([frontier for frontier in nav_goals if type(frontier)==Frontier])
+                rr.log(
+                    "map/frontiers_and_POIs",
+                    rr.Points2D(rotate_frame(pts), colors=np.flip(monochannel_to_inferno_rgb(scores), axis=-1), radii=[1] * pts.shape[0])
+                )               
 
         if len(nav_goals) == 0:
             if not self.initializing and allow_retry:
                 self.reset_checked_map()
-                return self.compute_frontiers_and_POIs(allow_retry=False)
+                return self.compute_frontiers_and_POIs(mode, fallback_mode, allow_retry=False)
             return []
 
         self.initializing = False
-        return nav_goals
+        return sorted(nav_goals, key=lambda x: x.get_score(), reverse=True)
 
-    def split_frontiers_and_POIs(self, obj_detected: np.ndarray, nav_goals: List[NavGoal])->Dict[int, List[NavGoal]]:
+    def _find_closest_agent(self, start_pos:List[np.ndarray], mappers: List["Navigator"], nav_goals: List[NavGoal], prev_roles:List[str]) -> Tuple[int, list[np.ndarray], NavGoal]:
+        # If no agent sees the object, agent closest to NavGoal of max similarity becomes exploiter
+        paths = [None for _ in range(len(mappers))]
+        distances = np.ones(len(mappers))*np.inf
+        
+        while np.all(distances == np.inf) and len(nav_goals) > 0:
+            agent_best_nav_goals = np.array([list(mapper._get_current_nav_goal(pose, nav_goals)) for pose, mapper in zip(start_pos, mappers)])
+            best_nav_goal_id = np.min(agent_best_nav_goals[:,0])
+            best_nav_goal = nav_goals[best_nav_goal_id]
+            min_goal_dist = 2 if isinstance(best_nav_goal, Frontier) else 4
+
+            for m, mapper in enumerate(mappers):
+                if agent_best_nav_goals[m, 0] == best_nav_goal_id:
+                    paths[m] = Planning.compute_to_goal(
+                        start_pos[m], 
+                        self.navigable_map & (self.confidence_map > 0).cpu().numpy(),
+                        (self.confidence_map > 0).cpu().numpy(),
+                        best_nav_goal.get_descr_point(),
+                        mapper.obstcl_kernel_size, 
+                        min_goal_dist
+                    )
+                    distances[m] = np.linalg.norm(np.array(paths[m])[1:]-np.array(paths[m])[:-1], axis=1).sum() if paths[m] is not None else np.inf
+
+            # remove the nav goal. It is either unreachable by all agents, or will be assigned to the closest agent.
+            nav_goals.pop(best_nav_goal_id)
+        
+        if np.all(distances == np.inf):
+            return -1, None, None
+        
+        # keep consistency in case of equality
+        candidate_idx = np.argwhere(distances==np.min(distances)).flatten()
+        if len(candidate_idx) > 1 and np.any(prev_roles[candidate_idx] == "exploiter"):
+            best_idx =  np.argwhere(prev_roles[candidate_idx]== "exploiter").flatten()[0]
+        else: 
+            best_idx = candidate_idx[0]
+
+        return best_idx, paths[best_idx], best_nav_goal 
+
+    def assign_roles(self, start_pos:List[np.ndarray], mappers: List["Navigator"], nav_goals: List[NavGoal], unavailable_agents: List[bool]) -> np.ndarray:
+        prev_roles = np.array([mapper.role for mapper in mappers])
+        for mapper in mappers:
+            if mapper.object_detected:
+                mapper.role = "exploiter"
+            else:
+                mapper.role = "explorer"
+
+        # One or more agents sees the object, other ones should explore
+        roles = np.array([mapper.role for mapper in mappers], dtype='<U10')
+        if np.any(roles == "exploiter"):
+            return roles == "exploiter"
+        
+        # If no agent sees the object, agent closest to NavGoal of max similarity becomes exploiter
+        closest_agent_idx, path, best_nav_goal = self._find_closest_agent(start_pos, mappers, nav_goals, prev_roles)
+
+        if closest_agent_idx == -1:
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(f"Resetting checked map as no path found."))
+            self.reset_checked_map()
+            return roles == "exploiter"
+
+        closest_agent = mappers[closest_agent_idx]
+        closest_agent.role = "exploiter"
+        roles[closest_agent_idx] = "exploiter"
+
+        # if agent does not have a target, current path becomes new target.
+        if not unavailable_agents[closest_agent_idx]:
+            closest_agent.path = path
+            closest_agent._free_unattainable_goal_agent(start_pos[closest_agent_idx], best_nav_goal)
+
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(f"Agent {closest_agent.agent_id} (exploiter - from assign_roles): computed path of length {len(closest_agent.path)}"))
+                rr.log(
+                    f"map/agent_{closest_agent.agent_id}/frontiers_dispatch",
+                    rr.Points2D(rotate_frame([best_nav_goal.get_descr_point()]), colors=closest_agent.agent_color,radii=[1])
+                )
+
+        return roles == "exploiter"
+
+    def split_frontiers_and_POIs(self, unavailable_agents: np.ndarray, nav_goals: List[NavGoal])->Dict[int, List[NavGoal]]:
         agent_coords = self.agents_poses[..., :-1]
         objective_coords = np.array([nav_goal.get_descr_point() for nav_goal in nav_goals])
-
         n_agents = agent_coords.shape[0]
         n_obj = objective_coords.shape[0]
         if n_obj == 0:
             return {a_id:[] for a_id in range(n_agents)}
 
         # --- Step 0: filter active agents ---
-        active_mask = ~obj_detected
+        active_mask = ~unavailable_agents
         active_agent_ids = np.where(active_mask)[0]
 
         n_active = len(active_agent_ids)
@@ -450,8 +584,7 @@ class OneMap:
 
             assignments[agent_id].append(nav_goals[obj_id])
 
-        assignments = {k: sorted(v, key=lambda x: x.get_score(), reverse=True) for k, v in assignments.items()}
-
+        assignments = {k: sorted(v, key=lambda x: x.get_explore_score(), reverse=True) for k, v in assignments.items()}
         return assignments
 
 if __name__ == "__main__":

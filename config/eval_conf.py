@@ -19,6 +19,8 @@ class EvalConf:
     results_path: str
     use_pointnav: bool
     square_im: bool
+    mode: str
+    fallback_mode: str
 
 
 def load_eval_config():

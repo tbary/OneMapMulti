@@ -168,7 +168,6 @@ class MultiResultsReader:
         plt.savefig('output_plot.png')
 
     def read_results(self, path, sort_by, data_pkl=None, save_pkl=True):      
-        # !!! SPL is not properly defined for multi agents... Find another metric
         def compute_spl(sim: habitat_sim.Simulator, poses: List[np.ndarray], scenes:Dict[str, SceneAccumulated], experiment_num:int, seq_num:int, exploiting_agent:int):
             def get_geo_dist(pos, sim, possible_objs):
                 dists = []

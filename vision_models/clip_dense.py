@@ -222,48 +222,4 @@ class ClipModel(torch.nn.Module, BaseModel):
 
 
 if __name__ == "__main__":
-    import time
-    use_jetson = False
-    N = 1
-    import cv2
-    # start = torch.cuda.Event(enable_timing=True)
-    # end = torch.cuda.Event(enable_timing=True)
-    clip = ClipModel('../weights/clip.pth', use_jetson) # Jetson
-    img = read_image('rgb.jpg', format="RGB")
-    # img = read_image('/home/finn/drafting/CLIPTest/sim2.png', format="RGB")
-    # img = read_image('/home/Pictures/chair.png', format="RGB")
-    # img = read_image('/home/spot/chair.png', format="RGB")
-    # img = cv2.resize(img, (640, 640))
-    img = img.transpose(2, 0, 1)
-    img_feats_ = clip.get_image_features(img)
-    # print(img_feats_)
-    # text_feats = clip.encode_text("A photo of a robot endeffector")
-
-    # start.record()
-    # Perform N iterations and measure overall time
-    print("a")
-    start_time = time.time()
-    for i in range(N):
-        # img[:, i*5:(i+1*5)] -= i
-        img_feats = clip.get_image_features(img)
-        # print(img_feats.sum())
-        # print(img_feats.sum())
-        torch.cuda.synchronize()  # Synchronize after each forward pass
-
-    end_time = time.time()
-    # Compute overall time and average time per iteration
-    total_time = end_time - start_time
-    avg_time_per_iteration = total_time / N
-    # end.record()
-
-    print(f"Total time for {N} iterations: {total_time:.4f} seconds")
-    print(f"Average time per iteration: {avg_time_per_iteration:.4f} seconds")    # clip = ClipModel('weights/clip.pth', False) # Jetson
-    txt_feats = clip.get_text_features(["a chair"])
-    sim = clip.compute_similarity(img_feats, txt_feats)
-    print(sim.max(), sim.min(), sim.mean())
-    fig, axs = plt.subplots(1, 2)
-    axs[0].imshow(sim[0].detach().cpu())
-    axs[1].imshow(img.transpose(1, 2, 0))
-    plt.savefig("plant.png")
-    plt.show()
-    # print(img_feats.shape, text_feats.shape)
+    pass

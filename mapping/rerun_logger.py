@@ -2,6 +2,7 @@
 Mapping Rerun Logger. Sets up the experiment blueprint and logs the map and robot position.
 """
 import numpy as np
+import matplotlib.pyplot as plt
 import rerun as rr
 import rerun.blueprint as rrb
 
@@ -10,7 +11,7 @@ from .projection import Projection
 from onemap_utils import log_map_rerun
 
 def log_pos(x, y, agent):
-    agents_colors = [[255,0,0],[0,255,0],[0,0,255]]
+    agents_colors = [(int(r*255), int(g*255), int(b*255)) for r,g,b in plt.get_cmap('tab10').colors]
     rr.log(f"map/agent_{agent}/position", rr.Points2D(rotate_frame([[x, y]]), colors=[agents_colors[agent]], radii=[2]))
 
 def setup_blueprint_debug(n_agents):
@@ -30,7 +31,7 @@ def setup_blueprint_debug(n_agents):
                     rrb.Tabs(*[
                         rrb.TextLogView(origin="path_updates"),
                         rrb.TextLogView(origin="actions_updates"),
-                        rrb.Spatial3DView(origin="embeddings")
+                        rrb.TextLogView(origin="step"),
                     ]),
                 ),
             ),
@@ -68,8 +69,6 @@ def setup_blueprint_debug(n_agents):
                                                 "$origin/candidate",
                                                 *[f"$origin/agent_{i}/frontiers_dispatch" for i in range(n_agents)],
                                                 *[f"$origin/agent_{i}/position" for i in range(n_agents)],
-                                                *[f"$origin/agent_{i}/goal_pos" for i in range(n_agents)],
-                                                *[f"$origin/agent_{i}/path" for i in range(n_agents)],
                                                 *[f"$origin/agent_{i}/path_simplified" for i in range(n_agents)],
                                                 *[f"$origin/agent_{i}/proj_detect" for i in range(n_agents)],
                                             ]),
@@ -83,6 +82,7 @@ def setup_blueprint_debug(n_agents):
                                         name="Discovery",
                                         contents=
                                         ["$origin/discovery",
+                                         "$origin/zones",
                                          "$origin/largest_contour",
                                          *[f"$origin/agent_{i}/position" for i in range(n_agents)],
                                         ]),
@@ -120,8 +120,6 @@ def setup_blueprint(n_agents):
                         contents=[
                             "$origin/explored",
                             *[f"$origin/agent_{i}/position" for i in range(n_agents)],
-                            *[f"$origin/agent_{i}/goal_pos" for i in range(n_agents)],
-                            *[f"$origin/agent_{i}/path" for i in range(n_agents)],
                             *[f"$origin/agent_{i}/path_simplified" for i in range(n_agents)],
                         ]
                     ),
