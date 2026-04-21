@@ -12,7 +12,7 @@ def main():
     results_dir = eval_config.EvalConf.results_path
     
     data = os.path.join(results_dir, "data.pkl") if os.path.exists(os.path.join(results_dir, "data.pkl")) else None
-    evaluator.read_results(results_dir, "Episode Success",  None)
+    evaluator.read_results(results_dir, "Episode Success",  data)
 
 if __name__ == "__main__":
     np.seterr(all='raise')

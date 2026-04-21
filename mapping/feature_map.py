@@ -221,13 +221,12 @@ class OneMap:
             confs_old_obs = self.confidence_map[indices_obstacle]
 
             confidence_denominator = confs_new + confs_old
-            weight_1 = torch.nan_to_num(confs_old / confidence_denominator)
-            weight_2 = torch.nan_to_num(confs_new / confidence_denominator)
+            weight_1 = torch.nan_to_num(confs_old / confidence_denominator).unsqueeze(-1)
+            weight_2 = torch.nan_to_num(confs_new / confidence_denominator).unsqueeze(-1)
 
             self.updated_mask[indices] = True
 
-            self.feature_map[indices] = self.feature_map[indices] * weight_1.unsqueeze(-1) + \
-                                                       values_mapped.values().data * weight_2.unsqueeze(-1)
+            self.feature_map[indices] = self.feature_map[indices] * weight_1 + values_mapped.values().data * weight_2
 
             self.confidence_map[indices] = confidence_denominator
 
@@ -283,7 +282,7 @@ class OneMap:
                 
         if self.config.log_rerun:
             import matplotlib.pyplot as plt
-            frontier_colors = [(int(r*255), int(g*255), int(b*255)) for r,g,b in plt.get_cmap('tab20').colors]
+            frontier_colors = [(int(r*255), int(g*255), int(b*255)) for r,g,b in plt.get_cmap('tab20').colors] * (1 + len(frontiers)//20)
             disc_zones = []
             colors = []
             for f, frontier in enumerate(frontiers):
@@ -309,6 +308,19 @@ class OneMap:
             for cluster in clusters:
                 cluster.cluster_explore_score = 0
         
+        # if np.random.randint(0,25) == 10:
+        #     import uuid
+        #     import pickle
+        #     name = uuid.uuid4().hex
+            
+        #     with open(f"results_multi_one/frontiers_sim/{name}-feature_map.pkl", "wb") as f:
+        #         pickle.dump(self.feature_map.cpu().numpy(),f)
+        #     with open(f"results_multi_one/frontiers_sim/{name}-fully_explored_map.pkl", "wb") as f:
+        #         pickle.dump(self.fully_explored_map,f)
+        #     with open(f"results_multi_one/frontiers_sim/{name}-frontiers.pkl", "wb") as f:
+        #         pickle.dump([frontier.discovery_zone for frontier in frontiers],f)
+
+
         # if np.random.randint(0,100) == 50:
         #     arrays = []
         #     feature_map_array = self.feature_map.cpu().numpy()
@@ -332,19 +344,31 @@ class OneMap:
         #     np.save(filename, np.array(arrays, dtype=object), allow_pickle=True)           
 
         elif mode == "diversity":
-            feature_map_array = self.feature_map.cpu().numpy()
-            explored_map_features = feature_map_array[self.fully_explored_map & (feature_map_array.sum(axis=-1) != 0.0)]
+            fully_explored_map_cuda = torch.as_tensor(self.fully_explored_map, device=self.map_device)
+
+            valid_mask = fully_explored_map_cuda & (self.feature_map.sum(dim=-1) != 0.0)
+            explored_map_features = self.feature_map[valid_mask]  # shape: (N, D)
+
+            explored_norm = explored_map_features / (explored_map_features.norm(dim=-1, keepdim=True) + 1e-8)
+
             for frontier in frontiers:
                 points = frontier.discovery_zone
                 if not len(points):
                     frontier.frontier_explore_score = 0
-                else:
-                    frontier_features = feature_map_array[points[:, 0], points[:, 1]]
-                    dissim = 1-np.matmul(explored_map_features, frontier_features.T)
+                    continue
 
-                    dissim_per_frontier_point = np.min(dissim, axis=0)
-                    
-                    frontier.frontier_explore_score = np.mean(np.sort(dissim_per_frontier_point)[-75:])
+                frontier_features = self.feature_map[points[:, 0], points[:, 1]]  # shape: (M, D)
+
+                frontier_norm = frontier_features / (frontier_features.norm(dim=-1, keepdim=True) + 1e-8)
+
+                sim = explored_norm @ frontier_norm.T  # shape: (N, M)
+                dissim = 1 - sim.float()
+
+                dissim_per_point, _ = torch.min(dissim, dim=0)  # shape: (M,)
+                k = min(75, dissim_per_point.shape[0])
+                score = torch.topk(dissim_per_point, k).values.mean().item()
+
+                frontier.frontier_explore_score = score
 
             for cluster in clusters:
                 cluster.cluster_explore_score = 0
