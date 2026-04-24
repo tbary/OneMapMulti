@@ -108,9 +108,7 @@ class Navigator:
         # Models
         self.model = model
         self.detector = detector
-        self.sam = sam_model_registry["vit_t"](checkpoint="weights/mobile_sam.pt")
-        self.sam.to(device="cuda")
-        self.sam.eval()
+        self.sam = sam_model_registry["vit_t"](checkpoint="weights/mobile_sam.pt").to(device="cuda").eval()
         self.sam_predictor = SamPredictor(self.sam)
 
         self.one_map = one_map
@@ -126,8 +124,6 @@ class Navigator:
         self.last_pose = None
 
         self.first_obs = True
-        self.similar_points = None
-        self.similar_scores = None
         self.object_detected = False
         self.chosen_detection = None
         self.path = None
@@ -135,29 +131,26 @@ class Navigator:
         self.stuck_at_nav_goal_counter = 0
         self.stuck_at_cell_counter = 0
 
-        self.percentile_exploitation = config.planner.percentile_exploitation
-        self.no_nav_radius = int(config.planner.no_nav_radius / self.one_map.cell_size)
         self.max_detect_distance = int(config.planner.max_detect_distance / self.one_map.cell_size)
         self.obstcl_kernel_size = int(config.planner.obstcl_kernel_size / self.one_map.cell_size)
         self.min_goal_dist = int(config.planner.min_goal_dist / self.one_map.cell_size)
 
         # For the closed-vocabulary object detector, not needed for OneMap
-        self.class_map = {}
-        self.class_map["chair"] = "chair"
-        self.class_map["tv_monitor"] = "tv"
-        self.class_map["tv"] = "tv"
-        self.class_map["plant"] = "potted plant"
-        self.class_map["potted plant"] = "potted plant"
-        self.class_map["sofa"] = "couch"
-        self.class_map["couch"] = "couch"
-        self.class_map["bed"] = "bed"
-        self.class_map["toilet"] = "toilet"
+        self.class_map = {
+            "chair":"chair",
+            "tv_monitor":"tv",
+            "tv":"tv",
+            "plant":"potted plant",
+            "potted plant":"potted plant",
+            "sofa":"couch",
+            "couch":"couch",
+            "bed":"bed",
+            "toilet":"toilet"
+        }
 
     def reset(self):
         self.query_text = ["Other."]
         self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
-        self.similar_points = None
-        self.similar_scores = None
         self.object_detected = False
         self.chosen_detection = None
         self.last_nav_goal = None
@@ -216,15 +209,15 @@ class Navigator:
                 rr.log("path_updates", rr.TextLog(f"No path to object {self.query_text[0]} found."))
             return False
 
-    def _check_previous_frontier(self, assigned_nav_goals: List[NavGoal]):
-        if self.last_nav_goal is None or not len(assigned_nav_goals):
+    def __check_previous_frontier(self, nav_goals: List[NavGoal]):
+        if self.last_nav_goal is None or not len(nav_goals):
             return None, None
         
         last_point = self.last_nav_goal.get_descr_point()
 
         # Exact match
         current_index = None
-        for i, goal in enumerate(assigned_nav_goals):
+        for i, goal in enumerate(nav_goals):
             if np.array_equal(last_point, goal.get_descr_point()):
                 current_index = i
                 break
@@ -232,7 +225,7 @@ class Navigator:
         # Nearby match
         if current_index is None:
             closest_index = closest_point_within_threshold(
-                assigned_nav_goals,
+                nav_goals,
                 last_point,
                 0.5 / self.one_map.cell_size
             )
@@ -240,17 +233,15 @@ class Navigator:
                 return None, None
             
             current_index = closest_index
-        
-        if self.role == "explorer":
-            if assigned_nav_goals[current_index].get_explore_score() > 0:
-                return current_index, assigned_nav_goals[current_index]
-
-        current_score = assigned_nav_goals[current_index].get_score()
-        previous_score = self.last_nav_goal.get_score()
 
         # Check if goal still worth pursuing
-        if current_score + 0.01 > previous_score:
-            return current_index, assigned_nav_goals[current_index]
+        if self.role == "explorer":
+            if nav_goals[current_index].get_explore_score() > 0:
+                return current_index, nav_goals[current_index]
+
+        else:
+            if nav_goals[current_index].get_score() + 0.01 > self.last_nav_goal.get_score():
+                return current_index, nav_goals[current_index]
 
         return None, None
 
@@ -258,7 +249,7 @@ class Navigator:
         if self.object_detected:
             return False
         
-        nav_id, goal = self._check_previous_frontier(nav_goals)
+        nav_id, goal = self.__check_previous_frontier(nav_goals)
 
         if nav_id is None:
             return False
@@ -276,7 +267,7 @@ class Navigator:
         if self.path is None:
             return False
         
-        self._free_unattainable_goal_agent(start, goal)
+        self.free_unattainable_goal_agent(start, goal)
         
         if self.config.log_rerun:
             rr.log("path_updates", rr.TextLog(f"Agent {self.agent_id} ({self.role} - from try_previous): computed path of length {len(self.path)}"))
@@ -324,7 +315,7 @@ class Navigator:
                 rr.log("path_updates", rr.TextLog(f"Resetting checked map as no path found."))
             self.one_map.reset_checked_map()
 
-        self._free_unattainable_goal_agent(start, best_nav_goal)
+        self.free_unattainable_goal_agent(start, best_nav_goal)
 
         if self.config.log_rerun:
             similarity_mask = self._build_similarity_mask(kernel_size=3)
@@ -337,7 +328,7 @@ class Navigator:
                     rr.Points2D(rotate_frame(pts), colors=self.agent_color,radii=[1] * pts.shape[0])
                 )
 
-    def _free_unattainable_goal_agent(self, start, best_nav_goal:Union[Frontier, Cluster]):
+    def free_unattainable_goal_agent(self, start, best_nav_goal:Union[Frontier, Cluster]):
         nav_goal_coords = best_nav_goal.get_descr_point()
 
         if self.last_nav_goal is not None and not np.array_equal(self.last_nav_goal.get_descr_point(), nav_goal_coords):
@@ -386,7 +377,7 @@ class Navigator:
 
     def _build_similarity_mask(self, kernel_size=7):
         adjusted_score = self.one_map.similarity_map + 1.0
-        similarity_threshold = np.percentile(adjusted_score[self.one_map.confidence_map > 0], self.percentile_exploitation)
+        similarity_threshold = np.percentile(adjusted_score[self.one_map.confidence_map > 0], self.config.planner.percentile_exploitation)
         similarity_mask = (adjusted_score > similarity_threshold).astype(np.uint8)
 
         similarity_mask[self.one_map.confidence_map == 0] = 0

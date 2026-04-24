@@ -21,6 +21,7 @@ class EvalConf:
     square_im: bool
     mode: str
     fallback_mode: str
+    sort_seed: int
 
 
 def load_eval_config():

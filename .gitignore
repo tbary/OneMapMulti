@@ -15,3 +15,5 @@ yolov7
 weights
 datasets
 dev.ipynb
+test.py
+*.lprof

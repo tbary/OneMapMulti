@@ -55,12 +55,6 @@ def rotate_pcl(
     pointcloud[:, :2] = (r @ pointcloud[:, :2].T).T
     return pointcloud
 
-def print_memory_stats(label):
-    print(f"\n--- Memory Stats for {label} ---")
-    print(f"Allocated: {torch.cuda.memory_allocated() / 1e6:.2f} MB")
-    print(f"Cached: {torch.cuda.memory_reserved() / 1e6:.2f} MB")
-    print(f"Max Allocated: {torch.cuda.max_memory_allocated() / 1e6:.2f} MB")
-
 class FusionType(Enum):
     EMA = "EMA"
     SPATIAL = "Spatial"
@@ -83,6 +77,7 @@ class OneMap:
     last_nav_goal: Union[NavGoal, None]
 
     def __init__(self,
+                 sort_seed: int,
                  n_agents: int,
                  feature_dim: int,
                  config: MappingConf,
@@ -98,6 +93,7 @@ class OneMap:
         assert isinstance(fusion_type, FusionType), "Invalid fusion_type. It should be one of FusionType."
 
         self.config = config
+        self.sort_seed = sort_seed
 
         self.fusion_type = fusion_type
         self.map_device = map_device
@@ -107,10 +103,11 @@ class OneMap:
         self.feature_map = torch.zeros((self.config.n_points, self.config.n_points, feature_dim), dtype=torch.float32).to(self.map_device)
 
         self.obstacle_map = torch.zeros((self.config.n_points, self.config.n_points), dtype=torch.float32)
-        col_kernel_size = self.config.n_points / self.config.size * self.config.agent_radius
-        col_kernel_size = int(col_kernel_size) + (int(col_kernel_size) % 2 == 0)
         self.navigable_map = np.ones((self.config.n_points, self.config.n_points), dtype=bool)
         self.occluded_map = np.zeros((self.config.n_points, self.config.n_points), dtype=bool)
+
+        col_kernel_size = self.config.n_points / self.config.size * self.config.agent_radius
+        col_kernel_size = int(col_kernel_size) + (int(col_kernel_size) % 2 == 0)
         self.navigable_kernel = np.ones((col_kernel_size, col_kernel_size), np.uint8)
 
         self.blacklisted_nav_goals = []
@@ -192,12 +189,9 @@ class OneMap:
         values = values.permute(1, 2, 0)  # feature_dim last for convenience
         projected_submap = projection.project_dense(values, torch.Tensor(depth).to("cuda"), torch.tensor(tf_camera_to_episodic))
 
-        self._fuse_maps(*projected_submap, artificial_obstacles)
+        self.__fuse_maps(*projected_submap, artificial_obstacles)
 
-    def update_agent_pose(self, new_pose, agent_id):
-        self.agents_poses[agent_id] = np.array(new_pose)
-
-    def _fuse_maps(self,
+    def __fuse_maps(self,
                   confidences_mapped: torch.Tensor,
                   values_mapped: torch.Tensor,
                   obstacle_mapped: torch.Tensor,
@@ -218,8 +212,6 @@ class OneMap:
             confs_new = confidences_mapped.values().data.squeeze()
             confs_old = self.confidence_map[indices]
 
-            confs_old_obs = self.confidence_map[indices_obstacle]
-
             confidence_denominator = confs_new + confs_old
             weight_1 = torch.nan_to_num(confs_old / confidence_denominator).unsqueeze(-1)
             weight_2 = torch.nan_to_num(confs_new / confidence_denominator).unsqueeze(-1)
@@ -237,6 +229,7 @@ class OneMap:
 
             # Obstacle Map update
             confs_new = obstcl_confidence_mapped.values().data.squeeze()
+            confs_old_obs = self.confidence_map[indices_obstacle]
             confidence_denominator = confs_new + confs_old_obs
             weight_1 = torch.nan_to_num(confs_old_obs / confidence_denominator)
             weight_2 = torch.nan_to_num(confs_new / confidence_denominator)
@@ -253,6 +246,9 @@ class OneMap:
 
             self.fully_explored_map = (1.0 / (self.confidence_map.cpu().numpy() + 1e-8) < self.config.fully_explored_threshold)
             self.checked_map = (1.0 / (self.checked_conf_map.cpu().numpy() + 1e-8) < self.config.checked_map_threshold)
+
+    def update_agent_pose(self, new_pose, agent_id):
+        self.agents_poses[agent_id] = np.array(new_pose)
 
     def set_similarity_map(self, similarity_map: torch.Tensor|None, mask: np.ndarray|None = None) -> None:
         if mask is not None:
@@ -471,7 +467,13 @@ class OneMap:
             return []
 
         self.initializing = False
-        return sorted(nav_goals, key=lambda x: x.get_score(), reverse=True)
+
+        
+        if self.sort_seed == -1:
+            return sorted(nav_goals, key=lambda x: (x.get_score(), x.get_explore_score()), reverse=True)
+
+        rng = np.random.default_rng(self.sort_seed)
+        return sorted(nav_goals, key=lambda x: (x.get_score(), rng.random()), reverse=True)
 
     def _find_closest_agent(self, start_pos:List[np.ndarray], mappers: List["Navigator"], nav_goals: List[NavGoal], prev_roles:List[str]) -> Tuple[int, list[np.ndarray], NavGoal]:
         # If no agent sees the object, agent closest to NavGoal of max similarity becomes exploiter
@@ -540,7 +542,7 @@ class OneMap:
         # if agent does not have a target, current path becomes new target.
         if not unavailable_agents[closest_agent_idx]:
             closest_agent.path = path
-            closest_agent._free_unattainable_goal_agent(start_pos[closest_agent_idx], best_nav_goal)
+            closest_agent.free_unattainable_goal_agent(start_pos[closest_agent_idx], best_nav_goal)
 
             if self.config.log_rerun:
                 rr.log("path_updates", rr.TextLog(f"Agent {closest_agent.agent_id} (exploiter - from assign_roles): computed path of length {len(closest_agent.path)}"))
@@ -551,64 +553,65 @@ class OneMap:
 
         return roles == "exploiter"
 
-    def split_frontiers_and_POIs(self, unavailable_agents: np.ndarray, nav_goals: List[NavGoal])->Dict[int, List[NavGoal]]:
+    def split_frontiers_and_POIs(self, unavailable_agents: np.ndarray, nav_goals: List[NavGoal]) -> Dict[int, List[NavGoal]]:
         agent_coords = self.agents_poses[..., :-1]
         objective_coords = np.array([nav_goal.get_descr_point() for nav_goal in nav_goals])
         n_agents = agent_coords.shape[0]
         n_obj = objective_coords.shape[0]
+
         if n_obj == 0:
-            return {a_id:[] for a_id in range(n_agents)}
+            return {a_id: [] for a_id in range(n_agents)}
 
-        # --- Step 0: filter active agents ---
-        active_mask = ~unavailable_agents
-        active_agent_ids = np.where(active_mask)[0]
-
-        n_active = len(active_agent_ids)
-        if n_active == 0:
-            return {}
-
-        active_coords = agent_coords[active_mask]
-
-        # --- Step 1: compute distance matrix (only active agents) ---
+        # --- Step 1: compute distance matrix (all agents) ---
         dists = np.linalg.norm(
-            active_coords[:, None, :] - objective_coords[None, :, :],
+            agent_coords[:, None, :] - objective_coords[None, :, :],
             axis=2
-        )
-        
-        # --- Step 2: balanced assignment ---
-        k = n_obj // n_active
+        )  # shape: (n_agents, n_obj)
 
-        base_obj_count = k * n_active
-        base_indices = np.arange(n_obj)[:base_obj_count]
+        # --- Step 2: per-agent slot budgets ---
+        # Base share: distribute objectives as evenly as possible
+        base_k = n_obj // n_agents
+        # Unavailable agents get one fewer slot (min 0)
+        slots = np.where(unavailable_agents, np.maximum(base_k - 1, 0), base_k)
+        total_slots = int(slots.sum())
 
-        expanded_dists = np.repeat(dists[:, base_indices], k, axis=0)
+        # --- Step 3: build expanded distance matrix ---
+        # Each agent i is replicated slots[i] times as a "virtual row"
+        # Shape: (total_slots, n_obj)
+        expanded_rows = np.repeat(dists, slots, axis=0)           # distances
+        agent_ids_expanded = np.repeat(np.arange(n_agents), slots)  # track which agent each row belongs to
 
-        row_ind, col_ind = scipy.optimize.linear_sum_assignment(expanded_dists)
+        # Only assign as many objectives as we have virtual rows
+        n_assign = min(total_slots, n_obj)
+        row_ind, col_ind = scipy.optimize.linear_sum_assignment(expanded_rows[:, :n_assign])
 
-        # --- Step 3: build full assignment dict (ALL agents) ---
-        assignments = {i: [] for i in range(n_agents)}
+        # --- Step 4: build assignment dict ---
+        assignments: Dict[int, List[NavGoal]] = {i: [] for i in range(n_agents)}
         assigned_mask = np.zeros(n_obj, dtype=bool)
 
         for r_idx, c_idx in zip(row_ind, col_ind):
-            local_agent = r_idx // k              # index in active agents
-            agent_id = active_agent_ids[local_agent]  # map back to original ID
+            agent_id = agent_ids_expanded[r_idx]
+            assignments[agent_id].append(nav_goals[c_idx])
+            assigned_mask[c_idx] = True
 
-            obj_id = base_indices[c_idx]
+        # --- Step 5: assign remaining objectives to closest available agent ---
+        # Prefer active agents; fall back to unavailable if all are active
+        active_mask = ~unavailable_agents
+        for obj_id in np.where(~assigned_mask)[0]:
+            preferred = np.where(active_mask)[0]
+            pool = preferred if len(preferred) > 0 else np.arange(n_agents)
+            closest = pool[np.argmin(dists[pool, obj_id])]
+            assignments[closest].append(nav_goals[obj_id])
 
-            assignments[agent_id].append(nav_goals[obj_id])
-            assigned_mask[obj_id] = True
+        # --- Step 6: sort assignments ---
+        if self.sort_seed == -1:
+            assignments = {k: sorted(v, key=lambda x: (x.get_explore_score(), x.get_score()), reverse=True)
+                        for k, v in assignments.items()}
+        else:
+            rng = np.random.default_rng(self.sort_seed)
+            assignments = {k: sorted(v, key=lambda x: (x.get_explore_score(), rng.random()), reverse=True)
+                        for k, v in assignments.items()}
 
-        # --- Step 4: assign remaining objectives ---
-        remaining_objs = np.where(~assigned_mask)[0]
-
-        for obj_id in remaining_objs:
-            # only consider active agents
-            closest_local = np.argmin(dists[:, obj_id])
-            agent_id = active_agent_ids[closest_local]
-
-            assignments[agent_id].append(nav_goals[obj_id])
-
-        assignments = {k: sorted(v, key=lambda x: x.get_explore_score(), reverse=True) for k, v in assignments.items()}
         return assignments
 
 if __name__ == "__main__":

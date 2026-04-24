@@ -82,7 +82,7 @@ class MONActor(Actor):
         self.n_agents = config.n_agents
         self.init = 36*2 * config.n_agents
 
-        self.one_map = OneMap(config.n_agents, model.feature_dim, config.mapping, map_device="cpu")
+        self.one_map = OneMap(config.sort_seed, config.n_agents, model.feature_dim, config.mapping, map_device="cpu")
         self.projection = Projection(model.feature_dim, config.mapping)
         self.mappers = [Navigator(model, detector, self.one_map, self.projection, config, agent_id) for agent_id in range(config.n_agents)]
         

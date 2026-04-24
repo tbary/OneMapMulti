@@ -1,18 +1,18 @@
 EvalConf:
   multi_object: True
-  max_steps: 750
+  max_steps: 1500
   max_dist: 1.5
   is_gibson: False
   object_nav_path: "datasets/multiobject_episodes/"
   scene_path: "datasets/scene_datasets/"
-  results_path: "results_multi_three/div_greed/"
+  results_path: "results_multi_one/seed_3"
   log_rerun: False
-  n_agents: 3
+  n_agents: 1
   use_pointnav: False
   square_im: True
-  mode: diversity
+  mode: greedy
   fallback_mode: greedy
-  sort_seed: -1
+  sort_seed: 3
 
 config: [
   ./controller_habitat.yaml, # Default Habitat Controller

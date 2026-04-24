@@ -12,6 +12,7 @@ EvalConf:
   square_im: True
   mode: greedy
   fallback_mode: greedy
+  sort_seed: -1
 
 config: [
   ./controller_habitat.yaml, # Default Habitat Controller
