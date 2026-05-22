@@ -5,12 +5,12 @@ EvalConf:
   is_gibson: False
   object_nav_path: "datasets/multiobject_episodes/"
   scene_path: "datasets/scene_datasets/"
-  results_path: "results_multi_three/div_greed/"
+  results_path: "results_multi_four/greed/"
   log_rerun: False
-  n_agents: 3
+  n_agents: 4
   use_pointnav: False
   square_im: True
-  mode: diversity
+  mode: greedy
   fallback_mode: greedy
   sort_seed: -1
 

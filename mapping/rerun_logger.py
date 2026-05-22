@@ -84,6 +84,7 @@ def setup_blueprint_debug(n_agents):
                                         ["$origin/discovery",
                                          "$origin/zones",
                                          "$origin/largest_contour",
+                                         "$origin/frontiers_points",
                                          *[f"$origin/agent_{i}/position" for i in range(n_agents)],
                                         ]),
                                          

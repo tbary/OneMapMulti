@@ -188,7 +188,6 @@ class OneMap:
 
         values = values.permute(1, 2, 0)  # feature_dim last for convenience
         projected_submap = projection.project_dense(values, torch.Tensor(depth).to("cuda"), torch.tensor(tf_camera_to_episodic))
-
         self.__fuse_maps(*projected_submap, artificial_obstacles)
 
     def __fuse_maps(self,

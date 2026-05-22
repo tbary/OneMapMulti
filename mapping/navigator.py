@@ -530,7 +530,6 @@ class Navigator:
         px, py = self.projection.metric_to_px(odometry[0, 3], odometry[1, 3])
 
         self._free_stuck_agent(px, py, yaw)
-
         # Update onemap with new information
         image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
         self.one_map.update(self.projection, image_features, depth, odometry, self.artificial_obstacles)

@@ -7,6 +7,7 @@ weights/*
 # Pycache
 **__pycache__**
 results*/
+_results*/
 *.pt
 *.gz
 *.zip
@@ -17,3 +18,6 @@ datasets
 dev.ipynb
 test.py
 *.lprof
+*.pkl
+*.svg
+consumed_topics*

@@ -1,12 +1,12 @@
 EvalConf:
   multi_object: True
-  max_steps: 750
+  max_steps: 2000
   max_dist: 1.5
   is_gibson: False
   object_nav_path: "datasets/multiobject_episodes/"
   scene_path: "datasets/scene_datasets/"
   results_path: "results_multi_one"
-  log_rerun: False
+  log_rerun: True
   n_agents: 1
   use_pointnav: False
   square_im: True
