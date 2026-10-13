@@ -2,11 +2,13 @@
 This module contains the Navigator class, which is responsible for the main functionality. It updates Onemap and uses it
 for navigation and exploration.
 """
-from .feature_map import OneMap
+from .feature_map import OneMap, rotate_frame
 from .nav_goals.frontier import Frontier, detect_frontiers, get_frontier_midpoint
 from .nav_goals.clustering import Cluster, cluster_high_similarity_regions
 from .nav_goals.navigation_goals import NavGoal
 from .projection import Projection
+
+from onemap_utils import log_map_rerun
 
 from planning import Planning
 from vision_models.base_model import BaseModel
@@ -26,6 +28,7 @@ import torch
 
 # cv2
 import cv2
+import rerun as rr
 
 def closest_point_within_threshold(nav_goals: List[NavGoal], target_point: np.ndarray, threshold: float) -> int:
     """Find the point within the threshold distance that is closest to the target_point.
@@ -189,9 +192,13 @@ class Navigator:
         )
 
         if self.path and len(self.path) > 0:
+            if self.config.log_rerun:
+                rr.log("path_updates",rr.TextLog(f"Path to object {self.query_text[0]} of length {len(self.path)} computed."))
             return True
         
         else:
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(f"No path to object {self.query_text[0]} found."))
             return False
 
     def __check_previous_frontier(self, nav_goals: List[NavGoal]):
@@ -254,7 +261,15 @@ class Navigator:
         
         self.free_unattainable_goal_agent(start, goal)
 
+        if self.config.log_rerun:
+            rr.log("path_updates", rr.TextLog(f"Agent {self.agent_id} ({self.role} - from try_previous): computed path of length {len(self.path)}"))
+            rr.log(
+                f"map/agent_{self.agent_id}/frontiers_dispatch",
+                rr.Points2D(rotate_frame([goal.get_descr_point()]), colors=self.agent_color,radii=[1])
+            )
+
         nav_goals.pop(nav_id)
+
         return True
 
     def _get_current_nav_goal(self, start, assigned_nav_goals:List[NavGoal])->Tuple[int, Union[Frontier, Cluster]]:
@@ -289,9 +304,22 @@ class Navigator:
                 assigned_nav_goals.pop(best_idx)
 
         if self.path is None:
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(f"Resetting checked map as no path found."))
             self.one_map.reset_checked_map()
 
         self.free_unattainable_goal_agent(start, best_nav_goal)
+
+        if self.config.log_rerun:
+            similarity_mask = self._build_similarity_mask(kernel_size=3)
+            log_map_rerun(similarity_mask, path="map/similarity_th")
+            if self.path:
+                rr.log("path_updates", rr.TextLog(f"Agent {self.agent_id} ({self.role} - from compute_best): computed path of length {len(self.path)}"))
+                pts = np.array([nav_goal.get_descr_point() for nav_goal in assigned_nav_goals])
+                rr.log(
+                    f"map/agent_{self.agent_id}/frontiers_dispatch",
+                    rr.Points2D(rotate_frame(pts), colors=self.agent_color,radii=[1] * pts.shape[0])
+                )
 
     def free_unattainable_goal_agent(self, start, best_nav_goal:Union[Frontier, Cluster]):
         nav_goal_coords = best_nav_goal.get_descr_point()
@@ -306,6 +334,11 @@ class Navigator:
         if self.stuck_at_nav_goal_counter > 10:
             # We probably are trying to reach an unreachable goal, for instance a frontier to the void in habitat
             self.one_map.blacklisted_nav_goals.append(nav_goal_coords)
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(
+                    f"Frontier at position {nav_goal_coords[0]},{nav_goal_coords[1]} invalid.")
+                )
+                rr.log(f"map/invalid_frontiers", rr.Points2D(positions=rotate_frame(self.one_map.blacklisted_nav_goals), colors=[[0,0,0]], radii=[0.5]))
         self.last_nav_goal = best_nav_goal
 
     def _free_stuck_agent(self, px, py, yaw):
@@ -328,6 +361,12 @@ class Navigator:
             facing_px = px + facing_dx
             facing_py = py + facing_dy
             self.artificial_obstacles.add((facing_px, facing_py))
+    
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(
+                    f"Agent {self.agent_id} stuck at position {(px,py)}. Trying to free...")
+                )
+                rr.log(f"map/artificial_obstacles", rr.Points2D(positions=rotate_frame(self.artificial_obstacles), colors=[[0,0,0]], radii=[0.5]))
 
     def _build_similarity_mask(self, kernel_size=7):
         adjusted_score = self.one_map.similarity_map + 1.0
@@ -354,8 +393,15 @@ class Navigator:
         x_rot += odometry[0, 3]
         y_rot += odometry[1, 3]
 
-        x_id = (x_rot / self.one_map.cell_size).astype(np.uint32) + self.projection.map_center_cells[0].item()
-        y_id = (y_rot / self.one_map.cell_size).astype(np.uint32) + self.projection.map_center_cells[1].item()
+        map_size = self.one_map.config.n_points
+        x_id = np.clip(
+            (x_rot / self.one_map.cell_size).astype(np.int64) + self.projection.map_center_cells[0].item(),
+            0, map_size - 1
+        ).astype(np.int64)
+        y_id = np.clip(
+            (y_rot / self.one_map.cell_size).astype(np.int64) + self.projection.map_center_cells[1].item(),
+            0, map_size - 1
+        ).astype(np.int64)
 
         return x_id, y_id, object_depths
 
@@ -379,12 +425,25 @@ class Navigator:
         return True
 
     def check_object_in_image(self, image: np.ndarray, depth: np.ndarray, odometry: np.ndarray)->bool:
+        h, w = image.shape[1], image.shape[2]
+        if depth.shape != (h, w):
+            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
         # Case: the queried object was detected in the current image
         detections = self.detector.detect(image.transpose(1, 2, 0))
         if len(detections["boxes"]) > 0:
             # wants rgb
             self.sam_predictor.set_image(image.transpose(1, 2, 0))
             for area, confidence in zip(detections["boxes"], detections['scores']):
+                if self.config.log_rerun:
+                    rr.log(
+                        f"agent_{self.agent_id}/camera/detection", 
+                        rr.Boxes2D(
+                            array_format=rr.Box2DFormat.XYXY, 
+                            array=area, colors=[[0,255,0]],
+                            labels=[f"Conf.: {confidence:.2f}"]
+                        ), 
+                    )
+                    rr.log("object_detections", rr.TextLog(f"Object {self.query_text[0]} detected"))
 
                 # Obtain the object masks.
                 masks, *_ = self.sam_predictor.predict(
@@ -399,6 +458,12 @@ class Navigator:
                     x_id, y_id, object_depths = self._convert_to_map_coordinates(depth, odometry, masks)
 
                     adjusted_score = self.one_map.similarity_map + 1.0  # only positive scores
+                    if self.config.log_rerun:
+                        rr.log(
+                            f"map/agent_{self.agent_id}/proj_detect",
+                            rr.Points2D(np.stack((y_id, x_id)).T, colors=[[0, 0, 255]], radii=[1])
+                        )
+                        rr.log(f"agent_{self.agent_id}/camera/mask", rr.SegmentationImage(masks[0].astype(np.uint8)))
 
                     # Check whether the detected object is valid
                     if self.config.planner.consensus_filtering:
@@ -418,8 +483,14 @@ class Navigator:
                         self.object_detected = self.compute_best_path_to_object(np.array([px, py]))
                         if not self.path:
                             self.path = old_path
+                        else:
+                            if self.config.log_rerun:
+                                rr.log("path_updates",rr.TextLog(f"The object {self.query_text[0]} has been detected just now."))
 
         else:
+            if self.config.log_rerun:
+                rr.log(f"agent_{self.agent_id}/camera/detection", rr.Clear(recursive=True))
+                rr.log(f"map/agent_{self.agent_id}/proj_detect", rr.Clear(recursive=True))
             if not self.object_detected:
                 self.chosen_detection = None
         return self.object_detected
@@ -435,6 +506,8 @@ class Navigator:
 
             if not similarity_mask[tuple(self.chosen_detection)]:
                 self.object_detected = False
+                if self.config.log_rerun:    
+                    rr.log("path_updates", rr.TextLog("Current path lost similarity."))
                 return -1
     
         if self.config.planner.allow_replan:
@@ -454,7 +527,10 @@ class Navigator:
         :param odometry: 4x4 transformation matrix from camera to world
         :return: boolean indicating if the episode is over
         """
-        
+        h, w = image.shape[1], image.shape[2]
+        if depth.shape != (h, w):
+            depth = cv2.resize(depth, (w, h), interpolation=cv2.INTER_NEAREST)
+
         yaw = np.arctan2(odometry[1, 0], odometry[0, 0])
         px, py = self.projection.metric_to_px(odometry[0, 3], odometry[1, 3])
 

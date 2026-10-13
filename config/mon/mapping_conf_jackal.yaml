@@ -1,0 +1,25 @@
+MappingConf: # [all in feature_map.py]
+  # Adapted from mapping_conf_spot.yaml for the Jackal's RealSense, mounted
+  # at 0.30m height (see camera_tf static transform in on_hardware launch
+  # files), vs. Spot's 0.43m. floor_level/obstacle_min/obstacle_max/
+  # floor_threshold are relative to the camera, so they were shifted to
+  # keep the same physical band relative to the floor as the Spot config.
+  # First pass -- validate against real depth data before trusting at speed.
+  n_points: 300  # Number of grid cells per dim
+  size: 60 # in meters, size of the map per dim
+  agent_radius: 0.3  # in meters, Jackal J100 half-width ~0.22m + margin
+  blur_kernel_size: 0.05  # in meters
+  obstacle_map_threshold: 0.5 # in occpuancy value
+  fully_explored_threshold: 0.3  #
+  checked_map_threshold: 0.3  #
+  depth_factor: 0.01  #
+  gradient_factor: 0.1
+  optimal_object_distance: 2.0
+  optimal_object_factor: 2.5
+  obstacle_min: -0.17
+  obstacle_max: 1.43
+  filter_stairs: False
+  floor_level: -0.30
+  floor_threshold: -0.42
+  frontier_depth: 3.0 # in meters
+  log_rerun: True

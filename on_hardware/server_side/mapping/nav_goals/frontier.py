@@ -3,7 +3,7 @@ Frontier detection and processing functions, adapted from https://github.com/bda
 """
 # numpy
 import numpy as np
-
+import rerun as rr
 # cv2
 import cv2
 
@@ -221,6 +221,7 @@ def detect_frontiers(
         cont_log = largest_contour.transpose(1, 0, 2)
         cont_log = np.flip(cont_log, axis=-1)
         cont_ret = np.flip(largest_contour, axis=-1)
+        rr.log("map/largest_contour", rr.LineStrips2D(cont_log[...,::-1]))
         frontiers = contour_to_frontiers(
             interpolate_contour(largest_contour), cv2.blur(  # blurring for some leeway
                     full_map, (3, 3)

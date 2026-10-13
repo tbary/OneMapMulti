@@ -15,9 +15,6 @@ from typing import Any, Union
 import matplotlib.pyplot as plt
 import random
 
-# numba
-from numba import jit, njit
-
 # CPP planning utils
 from planning_utils_cpp import dijkstra, compute_reachable_area, a_star_range
 

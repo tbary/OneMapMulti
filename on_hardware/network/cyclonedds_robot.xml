@@ -1,0 +1,1 @@
+<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="wlp3s0"/></Interfaces></General><Discovery><Peers><Peer address="192.168.50.172"/></Peers><ParticipantIndex>auto</ParticipantIndex></Discovery></Domain></CycloneDDS>

@@ -1,9 +1,12 @@
 import rclpy # type: ignore
 from rclpy.node import Node # type: ignore
-from std_msgs.msg import String, Float32MultiArray # type: ignore
+from std_msgs.msg import String, Float32MultiArray, Bool # type: ignore
 from sensor_msgs.msg import Image # type: ignore
 from cv_bridge import CvBridge # type: ignore
 from rclpy.executors import MultiThreadedExecutor # type: ignore
+from rclpy.qos import QoSPresetProfiles # type: ignore
+
+SENSOR_QOS = QoSPresetProfiles.SENSOR_DATA.value  # BEST_EFFORT, for camera images
 
 from scipy.spatial.transform import Rotation as R
 import numpy as np
@@ -113,8 +116,8 @@ class SubscriptionsListener:
             agent_topics = {
                 # "detections": BaseSubscriber(String,                      f"detections_{a}"),
                 # "extracted_features": BaseSubscriber(Float32MultiArray,   f"extracted_features_{a}"),
-                "depths":     BaseSubscriber(Image,                       f"depths_{a}"),
-                "rgbs":     BaseSubscriber(Image,                         f"rgbs_{a}"),
+                "depths":     BaseSubscriber(Image,                       f"depths_{a}",   SENSOR_QOS),
+                "rgbs":       BaseSubscriber(Image,                       f"rgbs_{a}",     SENSOR_QOS),
                 "odometries": BaseSubscriber(String,                      f"odometries_{a}"),
             }
 
@@ -186,6 +189,7 @@ class BroadcastManager:
             agent_publishers = {
                 "path": BasePublisher(Float32MultiArray, f"path_{a}"),
                 "target_object": BasePublisher(String, f"target_object_{a}"),
+                "spin": BasePublisher(Bool, f"spin_{a}"),   # initial 360 deg scan, see actor.py
             }
 
             self.publishers[a] = agent_publishers
@@ -193,10 +197,12 @@ class BroadcastManager:
             for node in agent_publishers.values():
                 self.executor.add_node(node)
 
-    def broadcast(self, paths, target_object):
+    def broadcast(self, paths, target_object, spin=None):
         for a in range(self.n_agents):
             self.publishers[a]["path"].publish(np.array(paths[a]).astype(np.float32).flatten().tolist())
             self.publishers[a]["target_object"].publish(target_object[a])
+            if spin is not None:
+                self.publishers[a]["spin"].publish(bool(spin[a]))
 
         self.executor.spin_once(timeout_sec=0.1)
 

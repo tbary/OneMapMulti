@@ -3,6 +3,7 @@ import os
 from .actor import MONActor
 from .ros_topics import SubscriptionsListener, BroadcastManager
 from config import EvalConf, load_eval_config
+from mapping import rerun_logger
 
 import matplotlib.pyplot as plt
 import tqdm
@@ -13,20 +14,24 @@ import rclpy # type: ignore
 # cv2
 import cv2
 
-# numpy
+import rerun as rr
 import numpy as np
 
-def warmup(listener, eval_config):
+def _normalize(x:np.ndarray):
+    return (x-x.min())/(x.max()-x.min())
+
+def warmup(listener, eval_config, timeout=300):
     print("Waiting for first messages...")
 
-    for attempt in range(5):
+    for attempt in range(timeout):
         state = listener.listen()
 
         all_ready = True
-        print(state)
         for n in range(eval_config.n_agents):
-            if any(v is None for v in state[n].values()):
-                print(f"Agent {n} is still warming up!")
+            missing = [k for k, v in state[n].items() if v is None]
+            if missing:
+                if attempt % 10 == 0:
+                    print(f"Agent {n} waiting for: {missing}")
                 all_ready = False
 
         if all_ready:
@@ -34,8 +39,8 @@ def warmup(listener, eval_config):
             return
 
         time.sleep(1)
-    else:
-        raise ValueError("Some agent topics seem to not broadcast data...")
+
+    raise ValueError("Some agent topics seem to not broadcast data...")
 
 def monochannel_to_inferno_rgb(image: np.ndarray) -> np.ndarray:
     """Convert a monochannel float32 image to an RGB representation using the Inferno
@@ -60,7 +65,7 @@ def monochannel_to_inferno_rgb(image: np.ndarray) -> np.ndarray:
 
     return inferno_colormap
 
-def main(actor: MONActor, config: EvalConf, listener:SubscriptionsListener, publisher:BroadcastManager, obj_sequence, results_path):
+def main(actor: MONActor, config: EvalConf, listener:SubscriptionsListener, publisher:BroadcastManager, obj_sequence, results_path, logger:rerun_logger.RerunLogger):
     agents_ids = list(range(config.n_agents))
 
     poses = [[] for _ in agents_ids]
@@ -83,10 +88,25 @@ def main(actor: MONActor, config: EvalConf, listener:SubscriptionsListener, publ
                 agent_messages = last_messages[a]
                 images.append(agent_messages["rgbs"])
                 depths.append(agent_messages["depths"])
-                odometries.append(agent_messages["odometries"])
+                odom = agent_messages["odometries"]
+                odometries.append(odom)
+                poses[a].append(np.array([odom[0,3], odom[1,3], odom[2,3], np.arctan2(odom[1, 0], odom[0, 0])]))
 
+                if config.log_rerun:
+                    cam_x = agent_messages["odometries"][0,3]
+                    cam_y = agent_messages["odometries"][1,3]
+
+                    rr.log(f"agent_{a}/camera/rgb", rr.Image(agent_messages["rgbs"].transpose(1, 2, 0)))
+                    rr.log(f"agent_{a}/camera/depth", rr.Image(_normalize(agent_messages["depths"])))
+                    rr.log(f"agent_{a}/camera/target", rr.Points2D(positions=[[125, 10]], labels=[f"Target: {current_obj}"], colors=[[255,255,255]]))
+                    logger.log_pos(actor.mappers[a].projection, cam_x, cam_y, a)
             paths, agent_called_found = actor.act(images, depths, odometries)
-            publisher.broadcast(paths, current_obj)
+            publisher.broadcast(paths, current_obj, spin=actor.spinning)
+
+            if config.log_rerun:
+                logger.log_map()
+                rr.log("step", rr.TextLog(steps))
+                rr.log("path_updates", rr.TextLog(steps))
 
             if steps % 100 == 0:
                 pbar.desc = f"Step {steps}, current object: {current_obj}"
@@ -165,11 +185,22 @@ if __name__ == "__main__":
     os.makedirs(results_path, exist_ok=True)
     obj_sequence = ["chair"]
 
+    run_name = os.environ.get("ONEMAP_RUN_NAME", "onemap_run")
+    rrd_path = f"{results_path}/{run_name}.rrd"
+    logger = rerun_logger.RerunLogger(actor.one_map, True, rrd_path, eval_config.n_agents) if eval_config.log_rerun else None
+
     warmup(listener, eval_config)
 
     try:
-        main(actor, eval_config, listener, publisher, obj_sequence, results_path)
+        main(actor, eval_config, listener, publisher, obj_sequence, results_path, logger)
     except KeyboardInterrupt: pass
     finally:
+        actor = None
+        listener = None
+        publisher = None
+
+        import gc
+        gc.collect()
+
         if rclpy.ok():
             rclpy.shutdown()

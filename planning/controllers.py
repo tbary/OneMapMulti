@@ -4,9 +4,13 @@ from abc import ABC, abstractmethod
 # numpy
 import numpy as np
 
-# habitat
-import habitat_sim
-from habitat_sim.utils import common as utils
+# habitat (simulation only — not available on hardware deployments)
+try:
+    import habitat_sim
+    from habitat_sim.utils import common as utils
+    _HABITAT_AVAILABLE = True
+except ImportError:
+    _HABITAT_AVAILABLE = False
 
 # conf
 from config import HabitatControllerConf, SpotControllerConf
@@ -30,7 +34,7 @@ class Controller(ABC):
 
 
 class HabitatController(Controller):
-    def __init__(self, sim: habitat_sim.Simulator, config: HabitatControllerConf):
+    def __init__(self, sim, config: HabitatControllerConf):
         self.sim = sim
         self.vel_control = habitat_sim.physics.VelocityControl()
         self.vel_control.controlling_lin_vel = True
