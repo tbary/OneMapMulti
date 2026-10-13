@@ -1,29 +1,69 @@
 name: "onemap"
+ 
 services:
+ 
   onemap:
+ 
     network_mode: "host"
+ 
     environment:
       - HM3D=${HM3D}
       - HM3D_PATH=${HM3D_PATH}
       - MATTERPORT_ID=${MATTERPORT_ID}
       - MATTERPORT_SECRET=${MATTERPORT_SECRET}
+
+      # NVIDIA / CUDA
       - NVIDIA_DRIVER_CAPABILITIES=all
       - NVIDIA_VISIBLE_DEVICES=all
+ 
+      # WSLg
+      - DISPLAY=${DISPLAY}
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY}
+      - XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir
+ 
+      # WSL GPU libraries
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+ 
     build:
+
       context: .
+
       args:
+
         HM3D: ${HM3D}
-        HM3D_PATH: ${HM3D_PATH} # Passed at build time
+
+        HM3D_PATH: ${HM3D_PATH}
+
         MATTERPORT_ID: ${MATTERPORT_ID}
+
         MATTERPORT_SECRET: ${MATTERPORT_SECRET}
+ 
     deploy:
+
       resources:
+
         reservations:
-            devices:
+
+          devices:
+
             - driver: "nvidia"
+
               count: all
+
               capabilities: [gpu]
+ 
     stdin_open: true
+
     tty: true
+ 
     volumes:
       - .:/onemap
+ 
+      # WSLg graphics
+      - /mnt/wslg:/mnt/wslg
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix
+ 
+    devices:
+      - /dev/dxg
+ 

@@ -82,10 +82,19 @@ COPY requirements.txt .
 RUN python3 -m pip install gdown torch torchvision torchaudio meson
 RUN python3 -m pip install -r requirements.txt
 RUN python3 -m pip install --upgrade timm>=1.0.7
-RUN CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5"  python3 -m pip install git+https://github.com/facebookresearch/habitat-sim.git@v0.2.4
+
+RUN git clone --branch v0.2.4 \
+https://github.com/facebookresearch/habitat-sim.git /tmp/habitat-sim
+ 
+RUN cd /tmp/habitat-sim && \
+    git submodule update --init --recursive --jobs 1
+ 
+RUN CMAKE_ARGS="-DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DHABITAT_WITH_CUDA=OFF" \
+    python3 -m pip install /tmp/habitat-sim
 # #
-# #
-RUN git clone https://github.com/WongKinYiu/yolov7
+RUN git clone https://github.com/WongKinYiu/yolov7 /opt/yolov7
+ENV PYTHONPATH="/opt/yolov7:/onemap"
+
 RUN mkdir -p weights
 RUN gdown 1D_RE4lvA-CiwrP75wsL8Iu1a6NrtrP9T -O weights/clip.pth
 RUN wget https://github.com/WongKinYiu/yolov7/releases/download/v0.1/yolov7-e6e.pt -O weights/yolov7-e6e.pt
@@ -99,9 +108,9 @@ COPY ./planning ./planning
 COPY ./planning_cpp ./planning_cpp
 COPY ./spot_utils ./spot_utils
 COPY ./vision_models ./vision_models
-COPY ./eval_habitat.py .
+# COPY ./eval_habitat.py .
 COPY ./eval_habitat_multi.py .
-COPY ./read_results.py .
+# COPY ./read_results.py .
 COPY ./read_results_multi.py .
 COPY ./onemap_utils ./onemap_utils
 COPY ./habitat_test.py ./
@@ -109,7 +118,6 @@ RUN python3 -m pip install ./planning_cpp/
 RUN mkdir datasets
 
 ENV PYTHONPATH="${PYTHONPATH}:/onemap/"
-ENV ROBOFLOW_API_KEY="FZtqpuOS9ITZiHjmxvWy"
 
 RUN  if [ "$HM3D" = "MINI" ] ; then python3 -m habitat_sim.utils.datasets_download \
   --username $MATTERPORT_ID --password $MATTERPORT_SECRET \
