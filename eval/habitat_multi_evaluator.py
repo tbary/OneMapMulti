@@ -266,7 +266,7 @@ class HabitatMultiEvaluator:
         if self.log_rerun:
             rr.log("map/ground_truth", rr.Points2D(rotate_frame(pts), colors=[[255, 255, 255]], radii=[1]))
 
-    def evaluate(self, from_scratch=False):
+    def evaluate(self, from_scratch=True):
         results:list[Metrics] = []
         agents_ids = list(range(self.n_agents))
 

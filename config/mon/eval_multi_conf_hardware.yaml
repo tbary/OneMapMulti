@@ -15,7 +15,7 @@ EvalConf:
   sort_seed: -1
 
 config: [
-  ./controller_habitat.yaml, # Default Habitat Controller
-  ./mapping_conf_sim.yaml,       # Default Mapping Configuration
+  ./controller_habitat.yaml, # Not used on hardware; jackal_node.py's own JackalController governs speed
+  ./mapping_conf_jackal.yaml,       # Jackal-calibrated mapping configuration (camera at 0.30m)
   ./planning_conf.yaml       # Default Planning Configuration
 ]

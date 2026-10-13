@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<dds xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <profiles>
+        <participant profile_name="wifi_peers" is_default_profile="true">
+            <rtps>
+                <builtin>
+                    <discovery_config>
+                        <discoveryProtocol>SIMPLE</discoveryProtocol>
+                        <ignoreParticipantFlags>NO_FILTER</ignoreParticipantFlags>
+                    </discovery_config>
+                    <initialPeersList>
+                        <locator>
+                            <udpv4>
+                                <address>192.168.50.172</address>
+                            </udpv4>
+                        </locator>
+                    </initialPeersList>
+                </builtin>
+            </rtps>
+        </participant>
+    </profiles>
+</dds>

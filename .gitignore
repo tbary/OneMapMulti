@@ -20,4 +20,6 @@ test.py
 *.lprof
 *.pkl
 *.svg
-consumed_topics*
+ros_bags*
+*.csv
+hardware_test/*

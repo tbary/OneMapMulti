@@ -7,14 +7,17 @@ import numpy as np
 
 from config import EvalConf
 
+import rerun as rr
+
 # MON
 from vision_models.clip_dense import ClipModel
 from vision_models.yolo_world_detector import YOLOWorldDetector
 from vision_models.yolov7_model import YOLOv7Detector
 
 
-from .mapping import Navigator, OneMap, Projection
+from .mapping import Navigator, OneMap, Projection, rotate_frame
 from .planning import Planning
+ 
 # scipy
 from scipy.spatial.transform import Rotation as R
 
@@ -55,7 +58,7 @@ class MONActor(Actor):
         self.fallback_mode = config.fallback_mode
 
         self.n_agents = config.n_agents
-        self.init = 36*2 * config.n_agents
+        self._start_spin()
 
         self.one_map = OneMap(config.sort_seed, config.n_agents, model.feature_dim, config.mapping, map_device="cpu")
         self.projection = Projection(model.feature_dim, config.mapping)
@@ -65,9 +68,35 @@ class MONActor(Actor):
         for mapper in self.mappers:
             mapper.projection.set_camera_matrix(K)
 
+    # Initial look-around before planning, like eval/actor.py's 72 x 'turn_left' in simulation.
+    # The robot can't take discrete turns, so main.py broadcasts spin_<a> and jackal_node.py turns
+    # in place; we stop once odometry shows a full turn (or give up after SPIN_MAX_STEPS).
+    SPIN_ANGLE = 2 * np.pi
+    SPIN_MAX_STEPS = 60   # ~20 s at ~3 steps/s; a normal scan takes ~30 steps
+
+    def _start_spin(self):
+        self.spinning = [True] * self.n_agents
+        self._spun = [0.0] * self.n_agents
+        self._spin_last_yaw = [None] * self.n_agents
+        self._spin_steps = [0] * self.n_agents
+
+    def _update_spin(self, yaws):
+        for a in range(self.n_agents):
+            if not self.spinning[a]:
+                continue
+            if self._spin_last_yaw[a] is not None:
+                self._spun[a] += abs((yaws[a] - self._spin_last_yaw[a] + np.pi) % (2 * np.pi) - np.pi)
+            self._spin_last_yaw[a] = yaws[a]
+            self._spin_steps[a] += 1
+            if self._spun[a] >= self.SPIN_ANGLE or self._spin_steps[a] >= self.SPIN_MAX_STEPS:
+                self.spinning[a] = False
+                rr.log("path_updates", rr.TextLog(
+                    f"Agent {a} initial scan done: {np.degrees(self._spun[a]):.0f} deg in {self._spin_steps[a]} steps"))
+
     def act(self, images:List[np.ndarray], depths:List[np.ndarray], odometries: List[np.ndarray]) -> Tuple[Dict, bool]:
         current_poses = [np.array(self.projection.metric_to_px(odom[0, 3], odom[1, 3]), dtype=int) for odom in odometries]
         yaws = [np.arctan2(odom[1, 0], odom[0, 0]) for odom in odometries]
+        self._update_spin(yaws)
 
         # Observe
         for a, mapper in enumerate(self.mappers):
@@ -85,7 +114,7 @@ class MONActor(Actor):
         obj_found = -1
         for a, mapper in enumerate(self.mappers):
 
-            if self.init == 0:
+            if not self.spinning[a]:
                 if mapper.object_detected:
                     obj_found = max(mapper.check_object_reached(current_poses[a]), obj_found) #TODO, could be more technically correct
 
@@ -97,15 +126,19 @@ class MONActor(Actor):
         # Act on plans
         paths = []
         for a, mapper in enumerate(self.mappers):
-            if self.init > 0:
+            if self.spinning[a]:
                 path = np.array([])
-                self.init -= 1
             else:
                 path = mapper.path
 
                 if path and len(path) > 0:
                     path = Planning.simplify_path(np.array(path))
                     path = np.array(path).astype(np.float32)
+                    rr.log(f"map/agent_{a}/path_simplified",  rr.LineStrips2D(
+                        rotate_frame(path), 
+                        colors=np.repeat(np.array(mapper.agent_color)[np.newaxis, :],
+                        path.shape[0], axis=0)
+                    ))
                     for i in range(path.shape[0]):
                         path[i, :] = self.projection.px_to_metric(path[i, 0], path[i, 1])
 
@@ -122,7 +155,7 @@ class MONActor(Actor):
     def reset(self):
         for mapper in self.mappers:
             mapper.reset()
-        self.init = 36*2 * self.n_agents
+        self._start_spin()
 
     def set_query(self, query: str):
         for mapper in self.mappers:

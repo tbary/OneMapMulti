@@ -10,7 +10,7 @@ from .projection import Projection
 
 from config import MappingConf
 from planning import Planning
-
+from onemap_utils import monochannel_to_inferno_rgb, log_map_rerun
 
 from skimage.measure import label
 from scipy.ndimage import distance_transform_edt
@@ -33,6 +33,8 @@ import torch
 
 # cv2
 import cv2
+
+import rerun as rr
 
 def rotate_frame(points):
     return [[y, x] for (x, y) in points]
@@ -270,6 +272,16 @@ class OneMap:
                     nearest_comp_label = connected_components[tuple(indices[...,fc[0], fc[1]])]
                     frontier.discovery_zone.extend(list(np.argwhere(connected_components == nearest_comp_label)))
             frontier.discovery_zone = np.unique(frontier.discovery_zone, axis=0)
+        if self.config.log_rerun:
+            import matplotlib.pyplot as plt
+            frontier_colors = [(int(r*255), int(g*255), int(b*255)) for r,g,b in plt.get_cmap('tab20').colors] * (1 + len(frontiers)//20)
+            disc_zones = []
+            colors = []
+            for f, frontier in enumerate(frontiers):
+                disc_zones.extend(frontier.discovery_zone)
+                colors.extend([frontier_colors[f]]*len(frontier.discovery_zone))
+            rr.log("map/zones", rr.Points2D(rotate_frame(disc_zones), colors=colors, radii=[0.5]*len(disc_zones)))
+            log_map_rerun(discovery_map, path="map/discovery")
 
     def set_exploration_scores(self, nav_goals:List[NavGoal], mode:Literal["size", "dist", "diversity", "certainty", "greedy"]="greedy", fallback:Literal["certainty", "greedy"]="greedy"):
         frontiers = [ng for ng in nav_goals if isinstance(ng, Frontier)]
@@ -355,6 +367,8 @@ class OneMap:
                
         if mode not in ["certainty", "greedy"] and (not len(frontiers) or np.all([frontier.frontier_explore_score == 0 for frontier in frontiers])):
             mode = fallback
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(f"Fallback activated ({mode}). {len(frontiers)} frontiers."))
 
         if mode == "certainty":
             for frontier in frontiers:
@@ -409,6 +423,10 @@ class OneMap:
                 if self._cluster_reachable(cluster, largest_contour) and not self.checked_map[tuple(cluster.center)]:
                     nav_goals.append(cluster)
 
+        if self.config.log_rerun:
+            log_map_rerun(self.confidence_map.cpu().numpy(), path="map/confidence")
+            log_map_rerun(unexplored_map, path="map/unexplored")
+
         frontiers = [f[..., ::-1].squeeze() for f in frontiers]  # need to flip coords for some reason
         adjusted_score_frontier = adjusted_score.copy()
 
@@ -427,6 +445,15 @@ class OneMap:
                 nav_goals.append(frontier)
 
         self.set_exploration_scores(nav_goals, mode=mode, fallback=fallback_mode)            
+
+        if self.config.log_rerun:
+            if len(nav_goals) > 0:
+                pts = np.array([nav_goal.get_descr_point() for nav_goal in nav_goals])
+                scores = np.array([nav_goal.get_score() for nav_goal in nav_goals])
+                rr.log(
+                    "map/frontiers_and_POIs",
+                    rr.Points2D(rotate_frame(pts), colors=np.flip(monochannel_to_inferno_rgb(scores), axis=-1), radii=[1] * pts.shape[0])
+                )
 
         if len(nav_goals) == 0:
             if not self.initializing and allow_retry:
@@ -499,6 +526,8 @@ class OneMap:
         closest_agent_idx, path, best_nav_goal = self._find_closest_agent(start_pos, mappers, nav_goals, prev_roles)
 
         if closest_agent_idx == -1:
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(f"Resetting checked map as no path found."))
             self.reset_checked_map()
             return roles == "exploiter"
 
@@ -510,6 +539,13 @@ class OneMap:
         if not unavailable_agents[closest_agent_idx]:
             closest_agent.path = path
             closest_agent.free_unattainable_goal_agent(start_pos[closest_agent_idx], best_nav_goal)
+
+            if self.config.log_rerun:
+                rr.log("path_updates", rr.TextLog(f"Agent {closest_agent.agent_id} (exploiter - from assign_roles): computed path of length {len(closest_agent.path)}"))
+                rr.log(
+                    f"map/agent_{closest_agent.agent_id}/frontiers_dispatch",
+                    rr.Points2D(rotate_frame([best_nav_goal.get_descr_point()]), colors=closest_agent.agent_color,radii=[1])
+                )
 
         return roles == "exploiter"
 
